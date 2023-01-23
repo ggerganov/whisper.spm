@@ -474,6 +474,12 @@ struct whisper_context {
     int64_t t_decode_us = 0;
     int64_t t_start_us  = 0;
 
+    int32_t n_sample = 0; // number of tokens sampled
+    int32_t n_encode = 0; // number of encoder calls
+    int32_t n_decode = 0; // number of decoder calls
+    int32_t n_fail_p = 0; // number of logprob threshold failures
+    int32_t n_fail_h = 0; // number of entropy threshold failures
+
     ggml_type wtype; // weight type (FP32 or FP16)
 
     whisper_mel mel;
@@ -1620,6 +1626,7 @@ static bool whisper_encode(
     ggml_free(ctx0);
 
     wctx.t_encode_us += ggml_time_us() - t_start_us;
+    wctx.n_encode++;
 
     return true;
 }
@@ -1993,6 +2000,7 @@ static bool whisper_decode(
     ggml_free(ctx0);
 
     wctx.t_decode_us += ggml_time_us() - t_start_us;
+    wctx.n_decode++;
 
     return true;
 }
@@ -2644,12 +2652,17 @@ whisper_token whisper_token_transcribe(void) {
 void whisper_print_timings(struct whisper_context * ctx) {
     const int64_t t_end_us = ggml_time_us();
 
+    const int32_t n_sample = std::max(1, ctx->n_sample);
+    const int32_t n_encode = std::max(1, ctx->n_encode);
+    const int32_t n_decode = std::max(1, ctx->n_decode);
+
     fprintf(stderr, "\n");
+    fprintf(stderr, "%s:     fallbacks = %3d p / %3d h\n", __func__, ctx->n_fail_p, ctx->n_fail_h);
     fprintf(stderr, "%s:     load time = %8.2f ms\n", __func__, ctx->t_load_us/1000.0f);
     fprintf(stderr, "%s:      mel time = %8.2f ms\n", __func__, ctx->t_mel_us/1000.0f);
-    fprintf(stderr, "%s:   sample time = %8.2f ms\n", __func__, ctx->t_sample_us/1000.0f);
-    fprintf(stderr, "%s:   encode time = %8.2f ms / %.2f ms per layer\n", __func__, ctx->t_encode_us/1000.0f, ctx->t_encode_us/1000.0f/ctx->model.hparams.n_audio_layer);
-    fprintf(stderr, "%s:   decode time = %8.2f ms / %.2f ms per layer\n", __func__, ctx->t_decode_us/1000.0f, ctx->t_decode_us/1000.0f/ctx->model.hparams.n_text_layer);
+    fprintf(stderr, "%s:   sample time = %8.2f ms / %5d runs (%8.2f ms per run)\n", __func__, 1e-3f*ctx->t_sample_us, n_sample, 1e-3f*ctx->t_sample_us/n_sample);
+    fprintf(stderr, "%s:   encode time = %8.2f ms / %5d runs (%8.2f ms per run)\n", __func__, 1e-3f*ctx->t_encode_us, n_encode, 1e-3f*ctx->t_encode_us/n_encode);
+    fprintf(stderr, "%s:   decode time = %8.2f ms / %5d runs (%8.2f ms per run)\n", __func__, 1e-3f*ctx->t_decode_us, n_decode, 1e-3f*ctx->t_decode_us/n_decode);
     fprintf(stderr, "%s:    total time = %8.2f ms\n", __func__, (t_end_us - ctx->t_start_us)/1000.0f);
 }
 
@@ -3004,7 +3017,7 @@ static void whisper_process_logits(
 }
 
 static whisper_token_data whisper_sample_token(
-      const whisper_context & ctx,
+            whisper_context & ctx,
       const whisper_decoder & decoder,
                        bool   best) {
     whisper_token_data result = {
@@ -3059,6 +3072,8 @@ static whisper_token_data whisper_sample_token(
         result.pt  = result.p;
     }
 
+    ctx.n_sample++;
+
     return result;
 }
 
@@ -3091,10 +3106,10 @@ static std::vector<whisper_token_data> whisper_sample_token_topk(
     std::vector<whisper_token_data> result;
     result.reserve(k);
 
-    whisper_token tid;
+    whisper_token tid = vocab.token_beg;
 
-    float pt;
-    float ptsum;
+    float pt    = 0.0;
+    float ptsum = 0.0;
 
     {
         double sum_ts = 0.0;
@@ -3126,6 +3141,8 @@ static std::vector<whisper_token_data> whisper_sample_token_topk(
             result[i].pt  = result[i].p;
         }
     }
+
+    ctx.n_sample++;
 
     return result;
 }
@@ -3432,7 +3449,7 @@ int whisper_full(
                 prompt.clear();
 
                 // if we have already generated some text, use it as a prompt to condition the next generation
-                if (!prompt_past.empty() && t_cur > 0.5f) {
+                if (!prompt_past.empty() && t_cur < 0.5f) {
                     int n_take = std::min(std::min(params.n_max_text_ctx, whisper_n_text_ctx(ctx)/2), int(prompt_past.size()));
 
                     prompt = { whisper_token_prev(ctx) };
@@ -3721,11 +3738,12 @@ int whisper_full(
                     WHISPER_PRINT_DEBUG("%s: decoder %2d: score = %8.5f, result_len = %3d, avg_logprobs = %8.5f, entropy = %8.5f\n",
                             __func__, j, decoder.sequence.score, decoder.sequence.result_len, decoder.sequence.avg_logprobs, decoder.sequence.entropy);
 
-                    if (decoder.sequence.result_len > 8 && decoder.sequence.entropy < params.entropy_thold) {
+                    if (decoder.sequence.result_len > 32 && decoder.sequence.entropy < params.entropy_thold) {
                         WHISPER_PRINT_DEBUG("%s: decoder %2d: failed due to entropy %8.5f < %8.5f\n",
                                 __func__, j, decoder.sequence.entropy, params.entropy_thold);
 
                         decoder.failed = true;
+                        ctx->n_fail_h++;
 
                         continue;
                     }
@@ -3747,6 +3765,7 @@ int whisper_full(
 
                 if (decoder.failed || decoder.sequence.avg_logprobs < params.logprob_thold) {
                     success = false;
+                    ctx->n_fail_p++;
                 }
 
                 if (success) {
@@ -3801,6 +3820,7 @@ int whisper_full(
 
                     if (tokens_cur[i].id > whisper_token_beg(ctx) && !params.single_segment) {
                         const auto t1 = seek + 2*(tokens_cur[i].tid - whisper_token_beg(ctx));
+
                         if (!text.empty()) {
                             const auto tt0 = params.speed_up ? 2*t0 : t0;
                             const auto tt1 = params.speed_up ? 2*t1 : t1;
@@ -4056,6 +4076,145 @@ struct whisper_token_data whisper_full_get_token_data(struct whisper_context * c
 float whisper_full_get_token_p(struct whisper_context * ctx, int i_segment, int i_token) {
     return ctx->result_all[i_segment].tokens[i_token].p;
 }
+
+// =================================================================================================
+
+//
+// Temporary interface needed for exposing ggml interface
+// Will be removed in the future when ggml becomes a separate library
+//
+
+WHISPER_API int whisper_bench_memcpy(int n_threads) {
+    ggml_time_init();
+
+    size_t n    = 50;
+    size_t arr  = n_threads > 0 ? 1024 : n_threads; // trick to avoid compiler optimizations
+
+    // 1 GB array
+    const size_t size = arr*1024llu*1024llu;
+
+    char * src = (char *) malloc(size);
+    char * dst = (char *) malloc(size);
+
+    for (size_t i = 0; i < size; i++) src[i] = i;
+
+    memcpy(dst, src, size); // heat-up
+
+    double tsum = 0.0;
+
+    for (size_t i = 0; i < n; i++) {
+        const int64_t t0 = ggml_time_us();
+
+        memcpy(dst, src, size);
+
+        const int64_t t1 = ggml_time_us();
+
+        tsum += (t1 - t0)*1e-6;
+
+        src[0] = rand();
+    }
+
+    fprintf(stderr, "memcpy: %.2f GB/s\n", (double) (n*size)/(tsum*1024llu*1024llu*1024llu));
+
+    // needed to prevent the compile from optimizing the memcpy away
+    {
+        double sum = 0.0;
+
+        for (size_t i = 0; i < size; i++) sum += dst[i];
+
+        fprintf(stderr, "sum:    %s %f\n", sum == -536870910.00 ? "ok" : "error", sum);
+    }
+
+    free(src);
+    free(dst);
+
+    return 0;
+}
+
+WHISPER_API int whisper_bench_ggml_mul_mat(int n_threads) {
+    ggml_time_init();
+
+    const int n_max = 128;
+
+    const std::vector<size_t> sizes = {
+        64, 128, 256, 512, 1024, 2048, 4096,
+    };
+
+    const size_t N_max = sizes.back();
+
+    // a: N*N*sizeof(float)
+    // b: N*N*sizeof(float)
+    // c: N*N*sizeof(float)
+    // when F16 is used, there is an extra work buffer of size N*N*sizeof(float)
+    std::vector<char> buf(4llu*N_max*N_max*sizeof(float) + 4*256);
+
+    for (size_t i = 0; i < buf.size(); i++) buf[i] = i;
+
+    for (int j = 0; j < (int) sizes.size(); j++) {
+        int n_fp16 = 0;
+        int n_fp32 = 0;
+
+        // GFLOPS/s
+        double s_fp16 = 0.0;
+        double s_fp32 = 0.0;
+
+        const size_t N = sizes[j];
+
+        for (int k = 0; k < 2; ++k) {
+            const ggml_type wtype = k == 0 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
+            double & s = k == 0 ? s_fp16 : s_fp32;
+            int    & n = k == 0 ? n_fp16   : n_fp32;
+
+            struct ggml_init_params gparams = {
+                /*.mem_size   =*/ buf.size(),
+                /*.mem_buffer =*/ buf.data(),
+            };
+
+            struct ggml_context * ctx0 = ggml_init(gparams);
+
+            struct ggml_tensor * a = ggml_new_tensor_2d(ctx0, wtype,         N, N);
+            struct ggml_tensor * b = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, N, N);
+
+            struct ggml_tensor * c = ggml_mul_mat(ctx0, a, b);
+
+            struct ggml_cgraph gf = ggml_build_forward(c);
+
+            gf.n_threads = n_threads;
+
+            double tsum = 0.0;
+
+            // heat-up
+            ggml_graph_compute(ctx0, &gf);
+
+            for (int i = 0; i < n_max; ++i) {
+                const int64_t t0 = ggml_time_us();
+
+                ggml_graph_compute(ctx0, &gf);
+
+                const int64_t t1 = ggml_time_us();
+
+                tsum += (t1 - t0)*1e-6;
+                n++;
+
+                if (tsum > 1.0 && n >= 3) {
+                    break;
+                }
+            }
+
+            ggml_free(ctx0);
+
+            s = ((2.0*N*N*N*n)/tsum)*1e-9;
+        }
+
+        fprintf(stderr, "ggml_mul_mat: %5zu x %5zu: F16 %8.1f GFLOPS (%3d runs) / F32 %8.1f GFLOPS (%3d runs)\n",
+            N, N, s_fp16, n_fp16, s_fp32, n_fp32);
+    }
+
+    return 0;
+}
+
+// =================================================================================================
 
 // =================================================================================================
 

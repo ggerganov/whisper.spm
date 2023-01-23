@@ -245,7 +245,7 @@ extern "C" {
         int duration_ms;        // audio duration to process in ms
 
         bool translate;
-        bool no_context;        // do not use initial prompt for the decoder (if any)
+        bool no_context;        // do not use past transcription (if any) as initial prompt for the decoder
         bool single_segment;    // force single segment output (useful for streaming)
         bool print_special;     // print special tokens (e.g. <SOT>, <EOT>, <BEG>, etc.)
         bool print_progress;    // print progress information
@@ -349,6 +349,13 @@ extern "C" {
 
     // Get the probability of the specified token in the specified segment.
     WHISPER_API float whisper_full_get_token_p(struct whisper_context * ctx, int i_segment, int i_token);
+
+    ////////////////////////////////////////////////////////////////////////////
+
+    // Temporary helpers needed for exposing ggml interface
+
+    WHISPER_API int whisper_bench_memcpy(int n_threads);
+    WHISPER_API int whisper_bench_ggml_mul_mat(int n_threads);
 
 #ifdef __cplusplus
 }
