@@ -13,8 +13,11 @@ Enter package URL: `https://github.com/ggerganov/whisper.spm`
 ## Build package from command line
 
 ```bash
-git clone https://github.com/ggeragnov/whisper.spm
+git clone https://github.com/dotmain/whisper.spm.git
 cd whisper.spm
+
+set working directory to project directory
+download models to models forlder
 
 # if building standalone
 make build
@@ -24,5 +27,19 @@ make build-submodule
 
 # run tests
 .build/debug/test-objc
+
+# run binary intelligence tests
 .build/debug/test-swift
 ```
+
+Binary Intelligence 
+Enjoy! 
+
+For testing purposes only. 
+Not for commercial use. 
+
+Please request licenses for commercial use with Mainvolume 
+www.github.com/dotmain
+www.github.com/mainvolume
+
+Thank you.
