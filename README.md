@@ -8,6 +8,8 @@ In XCode: File -> Add Packages
 
 Enter package URL: `https://github.com/ggerganov/whisper.spm`
 
+⚠️ Important: Set Dependency Rule to 'branch' -> 'master' otherwise you get an [Error with unsafe build flags](https://github.com/ggerganov/whisper.spm/issues/4)
+
 <img width="1091" alt="image" src="https://user-images.githubusercontent.com/1991296/200189694-aed421ae-6fd7-4b17-8211-e43040c32e97.png">
 
 ## Build package from command line
