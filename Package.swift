@@ -9,7 +9,7 @@ let package = Package(
             targets: ["whisper"])
     ],
     targets: [
-        .target(name: "whisper", dependencies:[], cSettings: [.unsafeFlags(["-O3", "-DGGML_USE_ACCELERATE=1"])]),
+        .target(name: "whisper", dependencies:[], cSettings: [.unsafeFlags(["-O3", "-DGGML_USE_ACCELERATE=1", "-DWHISPER_USE_COREML", "-DWHISPER_COREML_ALLOW_FALLBACK"])]),
         .target(name: "test-objc", dependencies:["whisper"]),
         .target(name: "test-swift", dependencies:["whisper"])
     ],
