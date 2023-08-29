@@ -1453,7 +1453,7 @@ static bool whisper_encode_internal(
     }
 
     struct ggml_tensor * cur;
-    bool use_coreml_surely = use_coreml;
+    bool use_coreml_surely = wstate.ctx_coreml != nullptr;
 
     if (use_coreml_surely) {
         wstate.use_buf(ctx0, -1);
