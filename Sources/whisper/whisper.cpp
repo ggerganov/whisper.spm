@@ -1463,7 +1463,7 @@ static bool whisper_encode_internal(
         whisper_coreml_encode(wstate.ctx_coreml, (float *) mel->data, (float *) cur->data);
 	 for (int i = 0; i < cur -> ne[0]; ++i) {
 	    if (isnan(((float *)(cur->data))[i])) {
-		// TODO: Greeshma throw error
+    		fprintf(stderr, "CoreML data error. Falling back to non CoreML implementation");
 		use_coreml_surely = false;
 	    }
 	}

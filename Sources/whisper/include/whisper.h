@@ -137,14 +137,14 @@ extern "C" {
         struct whisper_context * ctx,
                    const float * samples,
                            int   n_samples,
-                               int   n_threads);
+                           int   n_threads);
 
     WHISPER_API int whisper_pcm_to_mel_phase_vocoder_with_state(
         struct whisper_context * ctx,
           struct whisper_state * state,
                    const float * samples,
                            int   n_samples,
-                               int   n_threads);
+                           int   n_threads);
 
     // This can be used to set a custom log mel spectrogram inside the default state of the provided whisper context.
     // Use this instead of whisper_pcm_to_mel() if you want to provide your own log mel spectrogram.
