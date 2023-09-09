@@ -170,13 +170,15 @@ extern "C" {
     WHISPER_API int whisper_encode(
             struct whisper_context * ctx,
                                int   offset,
-                               int   n_threads);
+                               int   n_threads,
+			       bool  use_coreml);
 
     WHISPER_API int whisper_encode_with_state(
             struct whisper_context * ctx,
               struct whisper_state * state,
                                int   offset,
-                               int   n_threads);
+                               int   n_threads,
+			       bool  use_coreml);
 
     // Run the Whisper decoder to obtain the logits and probabilities for the next token.
     // Make sure to call whisper_encode() first.
@@ -232,6 +234,7 @@ extern "C" {
             struct whisper_context * ctx,
                                int   offset_ms,
                                int   n_threads,
+			       bool  use_coreml,
                              float * lang_probs);
 
     WHISPER_API int whisper_lang_auto_detect_with_state(
@@ -239,6 +242,7 @@ extern "C" {
               struct whisper_state * state,
                                int   offset_ms,
                                int   n_threads,
+			       bool  use_coreml,
                              float * lang_probs);
 
     WHISPER_API int whisper_n_len           (struct whisper_context * ctx); // mel length
@@ -407,6 +411,7 @@ extern "C" {
         // called by each decoder to filter obtained logits
         whisper_logits_filter_callback logits_filter_callback;
         void * logits_filter_callback_user_data;
+	bool use_coreml;
     };
 
     WHISPER_API struct whisper_full_params whisper_full_default_params(enum whisper_sampling_strategy strategy);
