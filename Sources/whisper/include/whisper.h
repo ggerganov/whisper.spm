@@ -67,6 +67,7 @@ extern "C" {
 
     struct whisper_context;
     struct whisper_state;
+    struct whisper_full_params;
 
     typedef int whisper_token;
 
@@ -110,9 +111,27 @@ extern "C" {
 
     WHISPER_API struct whisper_state * whisper_init_state(struct whisper_context * ctx);
 
+    // Given a context, enable use of OpenVINO for encode inference.
+    // model_path: Optional path to OpenVINO encoder IR model. If set to nullptr,
+    //                      the path will be generated from the ggml model path that was passed
+    //                      in to whisper_init_from_file. For example, if 'path_model' was
+    //                      "/path/to/ggml-base.en.bin", then OpenVINO IR model path will be
+    //                      assumed to be "/path/to/ggml-base.en-encoder-openvino.xml".
+    // device: OpenVINO device to run inference on ("CPU", "GPU", etc.)
+    // cache_dir: Optional cache directory that can speed up init time, especially for
+    //                     GPU, by caching compiled 'blobs' there.
+    //                     Set to nullptr if not used.
+    // Returns 0 on success. If OpenVINO is not enabled in build, this simply returns 1.
+    WHISPER_API int whisper_ctx_init_openvino_encoder(
+        struct whisper_context * ctx,
+                    const char * model_path,
+                    const char * device,
+                    const char * cache_dir);
+
     // Frees all allocated memory
     WHISPER_API void whisper_free      (struct whisper_context * ctx);
     WHISPER_API void whisper_free_state(struct whisper_state * state);
+    WHISPER_API void whisper_free_params(struct whisper_full_params * params);
 
     // Convert RAW PCM audio to log mel spectrogram.
     // The resulting spectrogram is stored inside the default state of the provided whisper context.
@@ -276,15 +295,16 @@ extern "C" {
     // Special tokens
     WHISPER_API whisper_token whisper_token_eot (struct whisper_context * ctx);
     WHISPER_API whisper_token whisper_token_sot (struct whisper_context * ctx);
-    WHISPER_API whisper_token whisper_token_prev(struct whisper_context * ctx);
     WHISPER_API whisper_token whisper_token_solm(struct whisper_context * ctx);
+    WHISPER_API whisper_token whisper_token_prev(struct whisper_context * ctx);
+    WHISPER_API whisper_token whisper_token_nosp(struct whisper_context * ctx);
     WHISPER_API whisper_token whisper_token_not (struct whisper_context * ctx);
     WHISPER_API whisper_token whisper_token_beg (struct whisper_context * ctx);
     WHISPER_API whisper_token whisper_token_lang(struct whisper_context * ctx, int lang_id);
 
     // Task tokens
-    WHISPER_API whisper_token whisper_token_translate (void);
-    WHISPER_API whisper_token whisper_token_transcribe(void);
+    WHISPER_API whisper_token whisper_token_translate (struct whisper_context * ctx);
+    WHISPER_API whisper_token whisper_token_transcribe(struct whisper_context * ctx);
 
     // Performance information from the default state.
     WHISPER_API void whisper_print_timings(struct whisper_context * ctx);
@@ -326,7 +346,7 @@ extern "C" {
                               void * user_data);
 
     // Parameters for the whisper_full() function
-    // If you chnage the order or add new parameters, make sure to update the default values in whisper.cpp:
+    // If you change the order or add new parameters, make sure to update the default values in whisper.cpp:
     // whisper_full_default_params()
     struct whisper_full_params {
         enum whisper_sampling_strategy strategy;
@@ -355,7 +375,11 @@ extern "C" {
         // [EXPERIMENTAL] speed-up techniques
         // note: these can significantly reduce the quality of the output
         bool speed_up;          // speed-up the audio by 2x using Phase Vocoder
+        bool debug_mode;        // enable debug_mode provides extra info (eg. Dump log_mel)
         int  audio_ctx;         // overwrite the audio context size (0 = use default)
+
+        // [EXPERIMENTAL] [TDRZ] tinydiarize
+        bool tdrz_enable;       // enable tinydiarize speaker turn detection
 
         // tokens to provide to the whisper decoder as initial prompt
         // these are prepended to any existing text context from a previous call
@@ -409,6 +433,8 @@ extern "C" {
         void * logits_filter_callback_user_data;
     };
 
+    // NOTE: this function allocates memory, and it is the responsibility of the caller to free the pointer - see whisper_free_params()
+    WHISPER_API struct whisper_full_params * whisper_full_default_params_by_ref(enum whisper_sampling_strategy strategy);
     WHISPER_API struct whisper_full_params whisper_full_default_params(enum whisper_sampling_strategy strategy);
 
     // Run the entire model: PCM -> log mel spectrogram -> encoder -> decoder -> text
@@ -457,6 +483,9 @@ extern "C" {
     WHISPER_API int64_t whisper_full_get_segment_t1           (struct whisper_context * ctx, int i_segment);
     WHISPER_API int64_t whisper_full_get_segment_t1_from_state(struct whisper_state * state, int i_segment);
 
+    // Get whether the next segment is predicted as a speaker turn
+    WHISPER_API bool whisper_full_get_segment_speaker_turn_next(struct whisper_context * ctx, int i_segment);
+
     // Get the text of the specified segment
     WHISPER_API const char * whisper_full_get_segment_text           (struct whisper_context * ctx, int i_segment);
     WHISPER_API const char * whisper_full_get_segment_text_from_state(struct whisper_state * state, int i_segment);
@@ -485,10 +514,15 @@ extern "C" {
 
     // Temporary helpers needed for exposing ggml interface
 
-    WHISPER_API int whisper_bench_memcpy(int n_threads);
-    WHISPER_API const char * whisper_bench_memcpy_str(int n_threads);
-    WHISPER_API int whisper_bench_ggml_mul_mat(int n_threads);
+    WHISPER_API int          whisper_bench_memcpy          (int n_threads);
+    WHISPER_API const char * whisper_bench_memcpy_str      (int n_threads);
+    WHISPER_API int          whisper_bench_ggml_mul_mat    (int n_threads);
     WHISPER_API const char * whisper_bench_ggml_mul_mat_str(int n_threads);
+
+    // Control logging output; default behavior is to print to stderr
+
+    typedef void (*whisper_log_callback)(const char * line);
+    WHISPER_API void whisper_set_log_callback(whisper_log_callback callback);
 
 #ifdef __cplusplus
 }
