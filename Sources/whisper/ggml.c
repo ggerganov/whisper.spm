@@ -4303,10 +4303,21 @@ int64_t ggml_nrows(const struct ggml_tensor * tensor) {
 }
 
 size_t ggml_nbytes(const struct ggml_tensor * tensor) {
-    size_t nbytes = tensor->ne[0]*tensor->nb[0]/ggml_blck_size(tensor->type);
-    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
-        nbytes += (tensor->ne[i] - 1)*tensor->nb[i];
+    size_t nbytes;
+    size_t blck_size = ggml_blck_size(tensor->type);
+    if (blck_size == 1) {
+        nbytes = ggml_type_size(tensor->type);
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            nbytes += (tensor->ne[i] - 1)*tensor->nb[i];
+        }
     }
+    else {
+        nbytes = tensor->ne[0]*tensor->nb[0]/blck_size;
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            nbytes += (tensor->ne[i] - 1)*tensor->nb[i];
+        }
+    }
+
     return nbytes;
 }
 
@@ -17283,10 +17294,18 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         } else {
             // wait for other threads to finish
             const int last = node_n;
-            do {
-                //sched_yield();
+            while (true) {
+                // TODO: this sched_yield can have significant impact on the performance - either positive or negative
+                //       depending on the workload and the operating system.
+                //       since it is not clear what is the best approach, it should potentially become user-configurable
+                //       ref: https://github.com/ggerganov/ggml/issues/291
+#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS)
+                sched_yield();
+#endif
+
                 node_n = atomic_load(&state->shared->node_n);
-            } while (node_n == last);
+                if (node_n != last) break;
+            };
         }
 
         // check if we should stop

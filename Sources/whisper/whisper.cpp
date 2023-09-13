@@ -29,6 +29,7 @@
 #include <vector>
 #include <regex>
 #include <random>
+#include <functional>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -596,6 +597,46 @@ struct kv_buf {
     std::vector<uint8_t> v;
 };
 
+// ggml_allocr wrapper for whisper usage
+struct whisper_allocr {
+    ggml_allocr * alloc = nullptr;
+
+    std::vector<uint8_t> meta;
+    std::vector<uint8_t> data;
+};
+
+static size_t whisper_allocr_size(struct whisper_allocr & allocr) {
+    return allocr.meta.size() + allocr.data.size();
+}
+
+// measure the memory usage of a graph and prepare the allocr's internal data buffer
+static void whisper_allocr_graph_init(struct whisper_allocr & allocr, std::function<struct ggml_cgraph *()> && get_graph) {
+    const int tensor_alignment = 32;
+
+    auto & alloc = allocr.alloc;
+    auto & meta  = allocr.meta;
+    auto & data  = allocr.data;
+
+    meta.resize(ggml_tensor_overhead()*GGML_MAX_NODES + ggml_graph_overhead());
+
+    alloc = ggml_allocr_new_measure(tensor_alignment);
+
+    const size_t alloc_size = ggml_allocr_alloc_graph(alloc, get_graph()) + tensor_alignment;
+
+    ggml_allocr_free(alloc);
+
+    data.resize(alloc_size);
+
+    alloc = ggml_allocr_new(data.data(), data.size(), tensor_alignment);
+}
+
+static void whisper_allocr_free(struct whisper_allocr & allocr) {
+    if (allocr.alloc) {
+        ggml_allocr_free(allocr.alloc);
+        allocr.alloc = nullptr;
+    }
+}
+
 struct whisper_state {
     int64_t t_sample_us = 0;
     int64_t t_encode_us = 0;
@@ -618,23 +659,20 @@ struct whisper_state {
     // buffer for swapping KV caches between decoders during beam-search
     std::vector<kv_buf> kv_swap_bufs;
 
-    // memory buffers used by encode / decode contexts
-    std::vector<uint8_t> buf_compute;
-
     // reusable buffer for `struct ggml_graph_plan.work_data`
     std::vector<uint8_t> work_buffer;
 
-    // ggml-alloc
-    std::vector<uint8_t> buf_encode;
-    std::vector<uint8_t> buf_encode_post;
-    std::vector<uint8_t> buf_decode;
-
-    ggml_allocr * alloc_encode      = NULL;
-    ggml_allocr * alloc_encode_post = NULL;
-    ggml_allocr * alloc_decode      = NULL;
+    // ggml-alloc:
+    // - stores meta info about the intermediate tensors into the `meta` buffers
+    // - stores the actual tensor data into the `data` buffers
+    whisper_allocr alloc_conv;
+    whisper_allocr alloc_encode;
+    whisper_allocr alloc_cross;
+    whisper_allocr alloc_decode;
 
     // result of the encoder
-    struct ggml_tensor * embd_enc = NULL;
+    struct ggml_tensor * embd_conv = nullptr;
+    struct ggml_tensor * embd_enc  = nullptr;
 
     // decode output (2-dimensional array: [n_tokens][n_vocab])
     std::vector<float> logits;
@@ -1395,7 +1433,25 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
     return true;
 }
 
-static struct ggml_cgraph * whisper_build_graph_encoder(
+static bool whisper_encode_external(const whisper_state & wstate) {
+    GGML_UNUSED(wstate);
+
+#ifndef WHISPER_USE_COREML
+    const bool use_coreml = false;
+#else
+    const bool use_coreml = wstate.ctx_coreml != nullptr;
+#endif
+
+#ifndef WHISPER_USE_OPENVINO
+    const bool use_openvino = false;
+#else
+    const bool use_openvino = wstate.ctx_openvino != nullptr;
+#endif
+
+    return use_coreml || use_openvino;
+}
+
+static struct ggml_cgraph * whisper_build_graph_conv(
         whisper_context & wctx,
           whisper_state & wstate,
               const int   mel_offset) {
@@ -1404,15 +1460,13 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
     const auto & hparams = model.hparams;
 
     const int n_ctx   = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : hparams.n_audio_ctx;
-    const int n_state = hparams.n_audio_state;
-    const int n_head  = hparams.n_audio_head;
-    const int n_layer = hparams.n_audio_layer;
+    const int n_state = hparams.n_audio_state; GGML_UNUSED(n_state);
 
     const int n_mels = hparams.n_mels;
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ wstate.buf_compute.size(),
-        /*.mem_buffer =*/ wstate.buf_compute.data(),
+        /*.mem_size   =*/ wstate.alloc_conv.meta.size(),
+        /*.mem_buffer =*/ wstate.alloc_conv.meta.data(),
         /*.no_alloc   =*/ true,
     };
 
@@ -1420,7 +1474,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
 
     ggml_cgraph * gf = ggml_new_graph(ctx0);
 
-    ggml_allocr * alloc = wstate.alloc_encode;
+    ggml_allocr * alloc = wstate.alloc_conv.alloc;
 
     struct ggml_tensor * mel = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 2*n_ctx, n_mels);
     ggml_allocr_alloc(alloc, mel);
@@ -1442,30 +1496,9 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
         }
     }
 
-    ggml_build_forward_expand(gf, mel);
+    struct ggml_tensor * cur = nullptr;
 
-    struct ggml_tensor * KQscale = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
-    ggml_allocr_alloc(alloc, KQscale);
-
-    if (!ggml_allocr_is_measure(alloc)) {
-        ggml_set_f32(KQscale, 1.0f/sqrt(float(n_state)/n_head));
-    }
-
-    struct ggml_tensor * cur;
-
-#ifndef WHISPER_USE_COREML
-    const bool use_coreml = false;
-#else
-    const bool use_coreml = wstate.ctx_coreml != nullptr;
-#endif
-
-#ifndef WHISPER_USE_OPENVINO
-    const bool use_openvino = false;
-#else
-    const bool use_openvino = wstate.ctx_openvino != nullptr;
-#endif
-
-    if (!use_coreml && !use_openvino) {
+    if (!whisper_encode_external(wstate)) {
         // convolution + gelu
         {
             cur = ggml_conv_1d_ph(ctx0, model.e_conv_1_w, mel, 1, 1);
@@ -1487,243 +1520,263 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
             cur = ggml_gelu(ctx0, cur);
         }
 
-        // ===================================================================
-        // NOTE: experimenting with partial evaluation of the encoder (ignore)
-        //static int iter = -1;
-        //const int n_iter = 1500/n_ctx;
-
-        //iter = (iter + 1) % n_iter;
-
-        //if (iter == 0) {
-        //    memset(model.memory_cross_k->data, 0, ggml_nbytes(model.memory_cross_k));
-        //    memset(model.memory_cross_v->data, 0, ggml_nbytes(model.memory_cross_v));
-        //}
-
-        static int iter = 0;
-
-        const size_t e_pe_stride = model.e_pe->ne[0]*ggml_element_size(model.e_pe);
-        const size_t e_pe_offset = model.e_pe->ne[0]*ggml_element_size(model.e_pe)*n_ctx*iter;
-
-        struct ggml_tensor * e_pe = ggml_view_2d(ctx0, model.e_pe, model.e_pe->ne[0], n_ctx, e_pe_stride, e_pe_offset);
-
-        cur = ggml_add(ctx0, e_pe, ggml_transpose(ctx0, cur));
-
-        // ===================================================================
-
-        // original:
-        //cur = ggml_add(ctx0, model.e_pe, ggml_transpose(ctx0, cur));
-
-        struct ggml_tensor * inpL = cur;
-
-        for (int il = 0; il < n_layer; ++il) {
-            const auto & layer = model.layers_encoder[il];
-
-            // norm
-            {
-                cur = ggml_norm(ctx0, inpL, hparams.eps);
-
-                // cur = ln_0_w*cur + ln_0_b
-                cur = ggml_add(ctx0,
-                        ggml_mul(ctx0,
-                            ggml_repeat(ctx0, layer.attn_ln_0_w, cur),
-                            cur),
-                        ggml_repeat(ctx0, layer.attn_ln_0_b, cur));
-            }
-
-            // self-attention
-            {
-                struct ggml_tensor * Qcur = ggml_mul_mat(ctx0,
-                        layer.attn_q_w,
-                        cur);
-
-                Qcur = ggml_add(ctx0,
-                        ggml_repeat(ctx0,
-                            layer.attn_q_b,
-                            Qcur),
-                        Qcur);
-
-                //Qcur = ggml_scale(ctx0, Qcur, ggml_new_f32(ctx0, pow(float(n_state)/n_head, -0.25)));
-
-                // note: no bias for Key
-                struct ggml_tensor * Kcur = ggml_mul_mat(ctx0,
-                        layer.attn_k_w,
-                        cur);
-
-                //Kcur = ggml_scale(ctx0, Kcur, ggml_new_f32(ctx0, pow(float(n_state)/n_head, -0.25)));
-
-                struct ggml_tensor * Vcur = ggml_mul_mat(ctx0,
-                        layer.attn_v_w,
-                        cur);
-
-                Vcur = ggml_add(ctx0,
-                        ggml_repeat(ctx0,
-                            layer.attn_v_b,
-                            Vcur),
-                        Vcur);
-
-                // ------
-
-#ifdef WHISPER_USE_FLASH_ATTN
-                struct ggml_tensor * Q =
-                    ggml_permute(ctx0,
-                            ggml_cpy(ctx0,
-                                Qcur,
-                                ggml_new_tensor_3d(ctx0, wctx.itype, n_state/n_head, n_head, n_ctx)),
-                            0, 2, 1, 3);
-
-                struct ggml_tensor * K =
-                    ggml_permute(ctx0,
-                            ggml_cpy(ctx0,
-                                Kcur,
-                                ggml_new_tensor_3d(ctx0, wctx.itype, n_state/n_head, n_head, n_ctx)),
-                            0, 2, 1, 3);
-
-                struct ggml_tensor * V =
-                    ggml_cpy(ctx0,
-                            ggml_permute(ctx0,
-                                ggml_reshape_3d(ctx0,
-                                    Vcur,
-                                    n_state/n_head, n_head, n_ctx),
-                                1, 2, 0, 3),
-                            ggml_new_tensor_3d(ctx0, wctx.itype, n_ctx, n_state/n_head, n_head));
-
-                struct ggml_tensor * KQV = ggml_flash_attn(ctx0, Q, K, V, false);
-#else
-                struct ggml_tensor * Q =
-                    ggml_permute(ctx0,
-                            ggml_cpy(ctx0,
-                                Qcur,
-                                ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_state/n_head, n_head, n_ctx)),
-                            0, 2, 1, 3);
-
-                struct ggml_tensor * K =
-                    ggml_permute(ctx0,
-                            ggml_cpy(ctx0,
-                                Kcur,
-                                ggml_new_tensor_3d(ctx0, wctx.itype, n_state/n_head, n_head, n_ctx)),
-                            0, 2, 1, 3);
-
-                // K * Q
-                struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
-
-                struct ggml_tensor * KQ_scaled = ggml_scale(ctx0, KQ, KQscale);
-
-                struct ggml_tensor * KQ_soft_max = ggml_soft_max(ctx0, KQ_scaled);
-
-                struct ggml_tensor * V =
-                    ggml_cpy(ctx0,
-                            ggml_permute(ctx0,
-                                ggml_reshape_3d(ctx0,
-                                    Vcur,
-                                    n_state/n_head, n_head, n_ctx),
-                                1, 2, 0, 3),
-                            ggml_new_tensor_3d(ctx0, wctx.itype, n_ctx, n_state/n_head, n_head)
-                            );
-
-                struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
-#endif
-                struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
-
-                cur = ggml_cpy(ctx0,
-                        KQV_merged,
-                        ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_state, n_ctx));
-            }
-
-            // projection
-            {
-                cur = ggml_mul_mat(ctx0,
-                        layer.attn_ln_1_w,
-                        cur);
-
-                cur = ggml_add(ctx0,
-                        ggml_repeat(ctx0, layer.attn_ln_1_b, cur),
-                        cur);
-            }
-
-            // add the input
-            cur = ggml_add(ctx0, cur, inpL);
-
-            struct ggml_tensor * inpFF = cur;
-
-            // feed-forward network
-            {
-                // norm
-                {
-                    cur = ggml_norm(ctx0, inpFF, hparams.eps);
-
-                    // cur = mlp_ln_w*cur + mlp_ln_b
-                    cur = ggml_add(ctx0,
-                            ggml_mul(ctx0,
-                                ggml_repeat(ctx0, layer.mlp_ln_w, cur),
-                                cur),
-                            ggml_repeat(ctx0, layer.mlp_ln_b, cur));
-                }
-
-#ifdef WHISPER_USE_FLASH_FF
-                cur = ggml_flash_ff(ctx0,
-                        ggml_cpy(ctx0, cur, ggml_new_tensor_2d(ctx0, wstate.itype, n_state, n_ctx)),
-                        layer.mlp_0_w, layer.mlp_0_b, layer.mlp_1_w, layer.mlp_1_b);
-#else
-                // fully connected
-                cur = ggml_mul_mat(ctx0,
-                        layer.mlp_0_w,
-                        cur);
-
-                cur = ggml_add(ctx0,
-                        ggml_repeat(ctx0, layer.mlp_0_b, cur),
-                        cur);
-
-                // GELU activation
-                cur = ggml_gelu(ctx0, cur);
-
-                // projection
-                cur = ggml_mul_mat(ctx0,
-                        layer.mlp_1_w,
-                        cur);
-
-                cur = ggml_add(ctx0,
-                        ggml_repeat(ctx0, layer.mlp_1_b, cur),
-                        cur);
-#endif
-            }
-
-            inpL = ggml_add(ctx0, cur, inpFF);
-        }
-
-        cur = inpL;
-
-        // norm
-        {
-            cur = ggml_norm(ctx0, cur, hparams.eps);
-
-            // cur = ln_f_g*cur + ln_f_b
-            cur = ggml_add(ctx0,
-                    ggml_mul(ctx0,
-                        ggml_repeat(ctx0, model.e_ln_w, cur),
-                        cur),
-                    ggml_repeat(ctx0, model.e_ln_b, cur));
-        }
-    }
+        wstate.embd_conv = cur;
+    } else {
 #ifdef WHISPER_USE_COREML
-    else if (use_coreml) {
         cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_state, n_ctx);
         ggml_allocr_alloc(alloc, cur);
 
         if (!ggml_allocr_is_measure(alloc)) {
             whisper_coreml_encode(wstate.ctx_coreml, (float *) mel->data, (float *) cur->data);
         }
-    }
 #endif
 #ifdef WHISPER_USE_OPENVINO
-    else if (use_openvino) {
         cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_state, n_ctx);
         ggml_allocr_alloc(alloc, cur);
 
         if (!ggml_allocr_is_measure(alloc)) {
             whisper_openvino_encode(wstate.ctx_openvino, mel, cur);
         }
-    }
 #endif
+
+        wstate.embd_enc = cur;
+    }
+
+    ggml_build_forward_expand(gf, cur);
+
+    ggml_free(ctx0);
+
+    return gf;
+}
+
+static struct ggml_cgraph * whisper_build_graph_encoder(
+        whisper_context & wctx,
+          whisper_state & wstate) {
+    const auto & model   = wctx.model;
+    const auto & hparams = model.hparams;
+
+    const int n_ctx   = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : hparams.n_audio_ctx;
+    const int n_state = hparams.n_audio_state;
+    const int n_head  = hparams.n_audio_head;
+    const int n_layer = hparams.n_audio_layer;
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ wstate.alloc_encode.meta.size(),
+        /*.mem_buffer =*/ wstate.alloc_encode.meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx0);
+
+    ggml_allocr * alloc = wstate.alloc_encode.alloc;
+
+    struct ggml_tensor * KQscale = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
+    ggml_allocr_alloc(alloc, KQscale);
+
+    if (!ggml_allocr_is_measure(alloc)) {
+        ggml_set_f32(KQscale, 1.0f/sqrt(float(n_state)/n_head));
+    }
+
+    struct ggml_tensor * cur = ggml_view_tensor(ctx0, wstate.embd_conv);
+
+    // ===================================================================
+    // NOTE: experimenting with partial evaluation of the encoder (ignore)
+    //static int iter = -1;
+    //const int n_iter = 1500/n_ctx;
+
+    //iter = (iter + 1) % n_iter;
+
+    //if (iter == 0) {
+    //    memset(model.memory_cross_k->data, 0, ggml_nbytes(model.memory_cross_k));
+    //    memset(model.memory_cross_v->data, 0, ggml_nbytes(model.memory_cross_v));
+    //}
+
+    static int iter = 0;
+
+    const size_t e_pe_stride = model.e_pe->ne[0]*ggml_element_size(model.e_pe);
+    const size_t e_pe_offset = model.e_pe->ne[0]*ggml_element_size(model.e_pe)*n_ctx*iter;
+
+    struct ggml_tensor * e_pe = ggml_view_2d(ctx0, model.e_pe, model.e_pe->ne[0], n_ctx, e_pe_stride, e_pe_offset);
+
+    cur = ggml_add(ctx0, e_pe, ggml_cont(ctx0, ggml_transpose(ctx0, cur)));
+
+    // ===================================================================
+
+    // original:
+    //cur = ggml_add(ctx0, model.e_pe, ggml_transpose(ctx0, cur));
+
+    struct ggml_tensor * inpL = cur;
+
+    for (int il = 0; il < n_layer; ++il) {
+        const auto & layer = model.layers_encoder[il];
+
+        // norm
+        {
+            cur = ggml_norm(ctx0, inpL, hparams.eps);
+
+            // cur = ln_0_w*cur + ln_0_b
+            cur = ggml_add(ctx0,
+                    ggml_mul(ctx0, cur, layer.attn_ln_0_w),
+                    layer.attn_ln_0_b);
+        }
+
+        // self-attention
+        {
+            struct ggml_tensor * Qcur = ggml_mul_mat(ctx0,
+                    layer.attn_q_w,
+                    cur);
+
+            Qcur = ggml_add(ctx0, Qcur, layer.attn_q_b);
+
+            //Qcur = ggml_scale(ctx0, Qcur, ggml_new_f32(ctx0, pow(float(n_state)/n_head, -0.25)));
+
+            // note: no bias for Key
+            struct ggml_tensor * Kcur = ggml_mul_mat(ctx0,
+                    layer.attn_k_w,
+                    cur);
+
+            //Kcur = ggml_scale(ctx0, Kcur, ggml_new_f32(ctx0, pow(float(n_state)/n_head, -0.25)));
+
+            struct ggml_tensor * Vcur = ggml_mul_mat(ctx0,
+                    layer.attn_v_w,
+                    cur);
+
+            Vcur = ggml_add(ctx0, Vcur, layer.attn_v_b);
+
+            // ------
+
+#ifdef WHISPER_USE_FLASH_ATTN
+            struct ggml_tensor * Q =
+                ggml_permute(ctx0,
+                        ggml_cpy(ctx0,
+                            Qcur,
+                            ggml_new_tensor_3d(ctx0, wctx.itype, n_state/n_head, n_head, n_ctx)),
+                        0, 2, 1, 3);
+
+            struct ggml_tensor * K =
+                ggml_permute(ctx0,
+                        ggml_cpy(ctx0,
+                            Kcur,
+                            ggml_new_tensor_3d(ctx0, wctx.itype, n_state/n_head, n_head, n_ctx)),
+                        0, 2, 1, 3);
+
+            struct ggml_tensor * V =
+                ggml_cpy(ctx0,
+                        ggml_permute(ctx0,
+                            ggml_reshape_3d(ctx0,
+                                Vcur,
+                                n_state/n_head, n_head, n_ctx),
+                            1, 2, 0, 3),
+                        ggml_new_tensor_3d(ctx0, wctx.itype, n_ctx, n_state/n_head, n_head));
+
+            struct ggml_tensor * KQV = ggml_flash_attn(ctx0, Q, K, V, false);
+#else
+            struct ggml_tensor * Q =
+                ggml_permute(ctx0,
+                        ggml_cpy(ctx0,
+                            Qcur,
+                            ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_state/n_head, n_head, n_ctx)),
+                        0, 2, 1, 3);
+
+            struct ggml_tensor * K =
+                ggml_permute(ctx0,
+                        ggml_cpy(ctx0,
+                            Kcur,
+                            ggml_new_tensor_3d(ctx0, wctx.itype, n_state/n_head, n_head, n_ctx)),
+                        0, 2, 1, 3);
+
+            // K * Q
+            struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, ggml_cont(ctx0, Q));
+
+            struct ggml_tensor * KQ_scaled = ggml_scale(ctx0, KQ, KQscale);
+
+            struct ggml_tensor * KQ_soft_max = ggml_soft_max(ctx0, KQ_scaled);
+
+            struct ggml_tensor * V =
+                ggml_cpy(ctx0,
+                        ggml_permute(ctx0,
+                            ggml_reshape_3d(ctx0,
+                                Vcur,
+                                n_state/n_head, n_head, n_ctx),
+                            1, 2, 0, 3),
+                        ggml_new_tensor_3d(ctx0, wctx.itype, n_ctx, n_state/n_head, n_head)
+                        );
+
+            struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
+#endif
+            struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+
+            cur = ggml_cpy(ctx0,
+                    KQV_merged,
+                    ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_state, n_ctx));
+        }
+
+        // projection
+        {
+            cur = ggml_mul_mat(ctx0,
+                    layer.attn_ln_1_w,
+                    cur);
+
+            cur = ggml_add(ctx0, cur, layer.attn_ln_1_b);
+        }
+
+        // add the input
+        cur = ggml_add(ctx0, cur, inpL);
+
+        struct ggml_tensor * inpFF = cur;
+
+        // feed-forward network
+        {
+            // norm
+            {
+                cur = ggml_norm(ctx0, inpFF, hparams.eps);
+
+                // cur = mlp_ln_w*cur + mlp_ln_b
+                cur = ggml_add(ctx0,
+                        ggml_mul(ctx0, cur, layer.mlp_ln_w),
+                        layer.mlp_ln_b);
+            }
+
+#ifdef WHISPER_USE_FLASH_FF
+            cur = ggml_flash_ff(ctx0,
+                    ggml_cpy(ctx0, cur, ggml_new_tensor_2d(ctx0, wstate.itype, n_state, n_ctx)),
+                    layer.mlp_0_w, layer.mlp_0_b, layer.mlp_1_w, layer.mlp_1_b);
+#else
+            // fully connected
+            cur = ggml_mul_mat(ctx0,
+                    layer.mlp_0_w,
+                    cur);
+
+            cur = ggml_add(ctx0, cur, layer.mlp_0_b);
+
+            // GELU activation
+            cur = ggml_gelu(ctx0, cur);
+
+            // projection
+            cur = ggml_mul_mat(ctx0,
+                    layer.mlp_1_w,
+                    cur);
+
+            cur = ggml_add(ctx0, cur, layer.mlp_1_b);
+#endif
+        }
+
+        inpL = ggml_add(ctx0, cur, inpFF);
+    }
+
+    cur = inpL;
+
+    // norm
+    {
+        cur = ggml_norm(ctx0, cur, hparams.eps);
+
+        // cur = ln_f_g*cur + ln_f_b
+        cur = ggml_add(ctx0,
+                ggml_mul(ctx0, cur, model.e_ln_w),
+                model.e_ln_b);
+    }
 
     ggml_build_forward_expand(gf, cur);
 
@@ -1746,7 +1799,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
 }
 
 // pre-compute cross-attention memory
-static struct ggml_cgraph * whisper_build_graph_encoder_post(
+static struct ggml_cgraph * whisper_build_graph_cross(
         whisper_context & wctx,
           whisper_state & wstate) {
     const auto & model   = wctx.model;
@@ -1757,8 +1810,8 @@ static struct ggml_cgraph * whisper_build_graph_encoder_post(
     const int n_head  = hparams.n_audio_head;
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ wstate.buf_compute.size(),
-        /*.mem_buffer =*/ wstate.buf_compute.data(),
+        /*.mem_size   =*/ wstate.alloc_cross.meta.size(),
+        /*.mem_buffer =*/ wstate.alloc_cross.meta.data(),
         /*.no_alloc   =*/ true,
     };
 
@@ -1766,7 +1819,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder_post(
 
     ggml_cgraph * gf = ggml_new_graph(ctx0);
 
-    ggml_allocr * alloc = wstate.alloc_encode_post;
+    ggml_allocr * alloc = wstate.alloc_cross.alloc;
 
     struct ggml_tensor * cur = ggml_view_tensor(ctx0, wstate.embd_enc);
 
@@ -1791,14 +1844,15 @@ static struct ggml_cgraph * whisper_build_graph_encoder_post(
                 cur);
 
         Vcross = ggml_add(ctx0,
-                ggml_repeat(ctx0,
-                    layer.cross_attn_v_b,
-                    Vcross),
-                Vcross);
+                    Vcross,
+                    layer.cross_attn_v_b);
 
         Vcross = ggml_transpose(ctx0, ggml_reshape_2d(ctx0, Vcross, n_state, n_ctx));
 
-        struct ggml_tensor * k = ggml_view_1d(ctx0, wstate.kv_cross.k, n_state*n_ctx, (ggml_element_size(wstate.kv_cross.k)*n_state)*(il*n_ctx));
+        struct ggml_tensor * k = ggml_view_1d(ctx0, wstate.kv_cross.k,
+                n_state*n_ctx,
+                (ggml_element_size(wstate.kv_cross.k)*n_state)*(il*n_ctx));
+
         struct ggml_tensor * v = ggml_view_2d(ctx0, wstate.kv_cross.v, n_ctx, n_state,
                 (   n_ctx)*ggml_element_size(wstate.kv_cross.v),
                 (il*n_ctx)*ggml_element_size(wstate.kv_cross.v)*n_state);
@@ -1831,64 +1885,63 @@ static bool whisper_encode_internal(
               const int   n_threads) {
     const int64_t t_start_us = ggml_time_us();
 
-    // encoder
+    // conv
     {
-        auto & alloc = wstate.alloc_encode;
+        auto & alloc = wstate.alloc_conv.alloc;
 
         ggml_allocr_reset(alloc);
 
-        ggml_cgraph * gf = whisper_build_graph_encoder(wctx, wstate, mel_offset);
+        ggml_cgraph * gf = whisper_build_graph_conv(wctx, wstate, mel_offset);
 
         ggml_allocr_alloc_graph(alloc, gf);
 
-#ifdef WHISPER_USE_COREML
+        if (!whisper_encode_external(wstate)) {
+            ggml_graph_compute_helper(wstate.work_buffer, gf, n_threads);
+        }
+    }
+
+    // encoder
+    if (!whisper_encode_external(wstate)) {
+        auto & alloc = wstate.alloc_encode.alloc;
+
+        ggml_allocr_reset(alloc);
+
+        ggml_cgraph * gf = whisper_build_graph_encoder(wctx, wstate);
+
+        ggml_allocr_alloc_graph(alloc, gf);
+
+#ifdef GGML_USE_METAL
+        if (wstate.ctx_metal) {
+            ggml_metal_set_n_cb     (wstate.ctx_metal, n_threads);
+            ggml_metal_graph_compute(wstate.ctx_metal, gf);
+        } else {
+            ggml_graph_compute_helper(wstate.work_buffer, gf, n_threads);
+        }
 #else
         ggml_graph_compute_helper(wstate.work_buffer, gf, n_threads);
 #endif
-
-        //auto cur = wstate.embd_enc;
-        ////auto cur = gf->leafs[0];
-        //printf("cur name = '%s'\n", cur->name);
-
-        //float * res = (float *) cur->data;
-        //for (int i = 0; i < 10; ++i) {
-        //    printf("%f ", res[i]);
-        //}
-        //printf("\n");
-        //double sum = 0.0;
-        //for (int i = 0; i < ggml_nelements(cur); ++i) {
-        //    sum += res[i];
-        //}
-        //printf("sum: %f\n", sum);
-        //printf("n: %d\n", ggml_nelements(cur));
     }
 
-    // encoder_post
+    // cross
     {
-        auto & alloc = wstate.alloc_encode_post;
+        auto & alloc = wstate.alloc_cross.alloc;
 
         ggml_allocr_reset(alloc);
 
-        ggml_cgraph * gf = whisper_build_graph_encoder_post(wctx, wstate);
+        ggml_cgraph * gf = whisper_build_graph_cross(wctx, wstate);
 
         ggml_allocr_alloc_graph(alloc, gf);
 
+#ifdef GGML_USE_METAL
+        if (wstate.ctx_metal) {
+            ggml_metal_set_n_cb     (wstate.ctx_metal, n_threads);
+            ggml_metal_graph_compute(wstate.ctx_metal, gf);
+        } else {
+            ggml_graph_compute_helper(wstate.work_buffer, gf, n_threads);
+        }
+#else
         ggml_graph_compute_helper(wstate.work_buffer, gf, n_threads);
-
-        //auto cur = gf->nodes[gf->n_nodes - 1];
-        //printf("cur name = '%s'\n", cur->name);
-
-        //ggml_fp16_t * res = (ggml_fp16_t *) cur->data;
-        //for (int i = 0; i < 10; ++i) {
-        //    printf("%f ", ggml_fp32_to_fp16(res[i]));
-        //}
-        //printf("\n");
-        //double sum = 0.0;
-        //for (int i = 0; i < ggml_nelements(cur); ++i) {
-        //    sum += ggml_fp32_to_fp16(res[i]);
-        //}
-        //printf("sum: %f\n", sum);
-        //printf("n: %d\n", ggml_nelements(cur));
+#endif
     }
 
     // ggml_graph_compute_with_ctx(ctx0, &gf, n_threads);
@@ -1924,8 +1977,8 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
     //WHISPER_PRINT_DEBUG("%s: n_past = %d, N = %d, M = %d, n_ctx = %d\n", __func__, n_past, N, M, n_ctx);
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ wstate.buf_compute.size(),
-        /*.mem_buffer =*/ wstate.buf_compute.data(),
+        /*.mem_size   =*/ wstate.alloc_decode.meta.size(),
+        /*.mem_buffer =*/ wstate.alloc_decode.meta.data(),
         /*.no_alloc   =*/ true,
     };
 
@@ -1933,7 +1986,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
     ggml_cgraph * gf = ggml_new_graph(ctx0);
 
-    ggml_allocr * alloc = wstate.alloc_decode;
+    ggml_allocr * alloc = wstate.alloc_decode.alloc;
 
     struct ggml_tensor * embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N);
     ggml_allocr_alloc(alloc, embd);
@@ -1976,9 +2029,9 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
             // cur = ln_0_w*cur + ln_0_b
             cur = ggml_add(ctx0,
                     ggml_mul(ctx0,
-                        ggml_repeat(ctx0, layer.attn_ln_0_w, cur),
-                        cur),
-                    ggml_repeat(ctx0, layer.attn_ln_0_b, cur));
+                        cur,
+                        layer.attn_ln_0_w),
+                    layer.attn_ln_0_b);
         }
 
         // self-attention
@@ -1988,10 +2041,8 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                     cur);
 
             Qcur = ggml_add(ctx0,
-                    ggml_repeat(ctx0,
-                        layer.attn_q_b,
-                        Qcur),
-                    Qcur);
+                        Qcur,
+                        layer.attn_q_b);
 
             Qcur = ggml_scale(ctx0, Qcur, KQscale);
 
@@ -2009,10 +2060,8 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                         cur);
 
                 Vcur = ggml_add(ctx0,
-                        ggml_repeat(ctx0,
-                            layer.attn_v_b,
-                            Vcur),
-                        Vcur);
+                            Vcur,
+                            layer.attn_v_b);
 
                 Vcur = ggml_transpose(ctx0, ggml_reshape_2d(ctx0, Vcur, n_state, N));
 
@@ -2029,20 +2078,18 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
             struct ggml_tensor * Q =
                 ggml_permute(ctx0,
-                        ggml_cpy(ctx0,
-                            Qcur,
-                            ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_state/n_head, n_head, N)),
+                        ggml_reshape_3d(ctx0, Qcur, n_state/n_head, n_head, N),
                         0, 2, 1, 3);
 
             struct ggml_tensor * K =
-                ggml_permute(ctx0,
-                        ggml_reshape_3d(ctx0,
-                            ggml_view_1d(ctx0, kv_self.k, (n_past + N)*n_state, il*n_ctx*ggml_element_size(kv_self.k)*n_state),
-                            n_state/n_head, n_head, n_past + N),
-                        0, 2, 1, 3);
+                ggml_view_3d(ctx0, kv_self.k,
+                        n_state/n_head, n_past + N, n_head,
+                        ggml_element_size(kv_self.k)*n_state,
+                        ggml_element_size(kv_self.k)*n_state/n_head,
+                        ggml_element_size(kv_self.k)*n_state*n_ctx*il);
 
             // K * Q
-            struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+            struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, ggml_cont(ctx0, Q));
 
             //struct ggml_tensor * KQ_scaled = ggml_scale(ctx0, KQ, KQ_scale);
 
@@ -2073,8 +2120,8 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                     cur);
 
             cur = ggml_add(ctx0,
-                    ggml_repeat(ctx0, layer.attn_ln_1_b, cur),
-                    cur);
+                    cur,
+                    layer.attn_ln_1_b);
         }
 
         // add the input
@@ -2087,9 +2134,9 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
             // cur = ln_0_w*cur + ln_0_b
             cur = ggml_add(ctx0,
                     ggml_mul(ctx0,
-                        ggml_repeat(ctx0, layer.cross_attn_ln_0_w, cur),
-                        cur),
-                    ggml_repeat(ctx0, layer.cross_attn_ln_0_b, cur));
+                        cur,
+                        layer.cross_attn_ln_0_w),
+                    layer.cross_attn_ln_0_b);
         }
 
         // cross-attention
@@ -2099,18 +2146,18 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                     cur);
 
             Qcur = ggml_add(ctx0,
-                    ggml_repeat(ctx0,
-                        layer.cross_attn_q_b,
-                        Qcur),
-                    Qcur);
+                        Qcur,
+                        layer.cross_attn_q_b);
 
             Qcur = ggml_scale(ctx0, Qcur, KQscale);
 
             // Kcross is already scaled
             struct ggml_tensor * Kcross =
-                ggml_reshape_3d(ctx0,
-                        ggml_view_1d(ctx0, wstate.kv_cross.k, M*n_state, il*M*ggml_element_size(wstate.kv_cross.k)*n_state),
-                        n_state/n_head, n_head, M);
+                ggml_view_3d(ctx0, wstate.kv_cross.k,
+                        n_state/n_head, M, n_head,
+                        ggml_element_size(wstate.kv_cross.k)*n_state,
+                        ggml_element_size(wstate.kv_cross.k)*n_state/n_head,
+                        ggml_element_size(wstate.kv_cross.k)*n_state*M*il);
 
             //struct ggml_tensor * Vcross =
             //    ggml_reshape_3d(ctx0,
@@ -2133,15 +2180,11 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
             struct ggml_tensor * Q =
                 ggml_permute(ctx0,
-                        ggml_cpy(ctx0,
-                            Qcur,
-                            ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_state/n_head, n_head, N)),
+                        ggml_reshape_3d(ctx0, Qcur, n_state/n_head, n_head, N),
                         0, 2, 1, 3);
 
-            struct ggml_tensor * K = ggml_permute(ctx0, Kcross, 0, 2, 1, 3);
-
             // K * Q
-            struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+            struct ggml_tensor * KQ = ggml_mul_mat(ctx0, Kcross, ggml_cont(ctx0, Q));
 
             //struct ggml_tensor * KQ_scaled =
             //    ggml_scale(ctx0,
@@ -2171,8 +2214,8 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                     cur);
 
             cur = ggml_add(ctx0,
-                    ggml_repeat(ctx0, layer.cross_attn_ln_1_b, cur),
-                    cur);
+                    cur,
+                    layer.cross_attn_ln_1_b);
         }
 
         // add the input
@@ -2189,9 +2232,9 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                 // cur = mlp_ln_w*cur + mlp_ln_b
                 cur = ggml_add(ctx0,
                         ggml_mul(ctx0,
-                            ggml_repeat(ctx0, layer.mlp_ln_w, cur),
-                            cur),
-                        ggml_repeat(ctx0, layer.mlp_ln_b, cur));
+                            cur,
+                            layer.mlp_ln_w),
+                        layer.mlp_ln_b);
             }
 
             // fully connected
@@ -2200,8 +2243,8 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                     cur);
 
             cur = ggml_add(ctx0,
-                    ggml_repeat(ctx0, layer.mlp_0_b, cur),
-                    cur);
+                    cur,
+                    layer.mlp_0_b);
 
             // GELU activation
             cur = ggml_gelu(ctx0, cur);
@@ -2212,8 +2255,8 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                     cur);
 
             cur = ggml_add(ctx0,
-                    ggml_repeat(ctx0, layer.mlp_1_b, cur),
-                    cur);
+                    cur,
+                    layer.mlp_1_b);
         }
 
         inpL = ggml_add(ctx0, cur, inpFF);
@@ -2227,9 +2270,9 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
         cur = ggml_add(ctx0,
                 ggml_mul(ctx0,
-                    ggml_repeat(ctx0, model.d_ln_w, cur),
-                    cur),
-                ggml_repeat(ctx0, model.d_ln_b, cur));
+                    cur,
+                    model.d_ln_w),
+                model.d_ln_b);
     }
 
     // compute logits only for the last token
@@ -2277,7 +2320,7 @@ static bool whisper_decode_internal(
 
     // decoder
     {
-        auto & alloc = wstate.alloc_decode;
+        auto & alloc = wstate.alloc_decode.alloc;
 
         ggml_allocr_reset(alloc);
 
@@ -2285,14 +2328,23 @@ static bool whisper_decode_internal(
 
         ggml_allocr_alloc_graph(alloc, gf);
 
-        ggml_graph_compute_helper(wstate.work_buffer, gf, n_threads);
-
         logits = gf->nodes[gf->n_nodes - 1];
+
+#ifdef GGML_USE_METAL
+        if (wstate.ctx_metal) {
+            ggml_metal_set_n_cb     (wstate.ctx_metal, n_threads);
+            ggml_metal_graph_compute(wstate.ctx_metal, gf);
+        } else {
+            ggml_graph_compute_helper(wstate.work_buffer, gf, n_threads);
+        }
+#else
+        ggml_graph_compute_helper(wstate.work_buffer, gf, n_threads);
+#endif
     }
 
     // extract logits for all N tokens
-    //logits_out.resize(N*n_vocab);
-    //memcpy(logits_out.data(), ggml_get_data(logits), sizeof(float)*N*n_vocab);
+    //logits_out.resize(n_tokens*n_vocab);
+    //memcpy(logits_out.data(), ggml_get_data(logits), sizeof(float)*n_tokens*n_vocab);
 
     // extract logits only for the last token
     logits_out.resize(n_vocab);
@@ -2754,6 +2806,7 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
     if (!state->ctx_coreml) {
         log("%s: failed to load Core ML model from '%s'\n", __func__, path_coreml.c_str());
 #ifndef WHISPER_COREML_ALLOW_FALLBACK
+        delete state;
         return nullptr;
 #endif
     } else {
@@ -2768,62 +2821,111 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
     // TAGS: WHISPER_DECODER_INIT
     state->decoders[0].sequence.tokens.reserve(ctx->model.hparams.n_text_ctx);
 
-    state->decoders[0].probs.reserve(ctx->vocab.n_vocab);
-    state->decoders[0].logits.reserve(ctx->vocab.n_vocab);
+    state->decoders[0].probs.reserve   (ctx->vocab.n_vocab);
+    state->decoders[0].logits.reserve  (ctx->vocab.n_vocab);
     state->decoders[0].logprobs.reserve(ctx->vocab.n_vocab);
 
-    state->buf_compute.resize(ggml_tensor_overhead()*GGML_MAX_NODES + ggml_graph_overhead());
-
-    static const size_t tensor_alignment = 32;
-
-    state->alloc_encode      = ggml_allocr_new_measure(tensor_alignment);
-    state->alloc_encode_post = ggml_allocr_new_measure(tensor_alignment);
-    state->alloc_decode      = ggml_allocr_new_measure(tensor_alignment);
-
-    // encoder allocator
+    // conv allocator
     {
-        ggml_cgraph * gf = whisper_build_graph_encoder(*ctx, *state, 0);
+        whisper_allocr_graph_init(state->alloc_conv,
+                [&]() {
+                    return whisper_build_graph_conv(*ctx, *state, 0);
+                });
 
-        const size_t alloc_size = ggml_allocr_alloc_graph(state->alloc_encode, gf) + tensor_alignment;
-        ggml_allocr_free(state->alloc_encode);
-
-        log("%s: compute buffer (encode)      = %7.2f MB\n", __func__, (state->buf_compute.size() + alloc_size) / 1024.0 / 1024.0);
-
-        state->buf_encode.resize(alloc_size);
-        state->alloc_encode = ggml_allocr_new(state->buf_encode.data(), state->buf_encode.size(), tensor_alignment);
+        log("%s: compute buffer (conv)   = %7.2f MB\n", __func__, whisper_allocr_size(state->alloc_conv) / 1024.0 / 1024.0);
     }
 
-    // encoder_post allocator
+    // encoder allocator
+    if (!whisper_encode_external(*state)) {
+        whisper_allocr_graph_init(state->alloc_encode,
+                [&]() {
+                    return whisper_build_graph_encoder(*ctx, *state);
+                });
+
+        log("%s: compute buffer (encode) = %7.2f MB\n", __func__, whisper_allocr_size(state->alloc_encode) / 1024.0 / 1024.0);
+    }
+
+    // cross allocator
     {
-        ggml_cgraph * gf = whisper_build_graph_encoder_post(*ctx, *state);
+        whisper_allocr_graph_init(state->alloc_cross,
+                [&]() {
+                    return whisper_build_graph_cross(*ctx, *state);
+                });
 
-        const size_t alloc_size = ggml_allocr_alloc_graph(state->alloc_encode_post, gf) + tensor_alignment;
-        ggml_allocr_free(state->alloc_encode_post);
-
-        log("%s: compute buffer (encode_post) = %7.2f MB\n", __func__, (state->buf_compute.size() + alloc_size) / 1024.0 / 1024.0);
-
-        state->buf_encode_post.resize(alloc_size);
-        state->alloc_encode_post = ggml_allocr_new(state->buf_encode_post.data(), state->buf_encode_post.size(), tensor_alignment);
+        log("%s: compute buffer (cross)  = %7.2f MB\n", __func__, whisper_allocr_size(state->alloc_cross) / 1024.0 / 1024.0);
     }
 
     // decoder allocator
     {
-        const auto & hparams = ctx->model.hparams;
+        whisper_allocr_graph_init(state->alloc_decode,
+                [&]() {
+                    const auto & hparams = ctx->model.hparams;
 
-        // TODO: make sure this is the worst-case scenario
-        const int n_tokens = hparams.n_text_ctx;
-        const int n_past   = 0;
+                    // TODO: make sure this is the worst-case scenario
+                    const int n_tokens = hparams.n_text_ctx;
+                    const int n_past   = 0;
 
-        ggml_cgraph * gf = whisper_build_graph_decoder(*ctx, *state, state->decoders[0], NULL, n_tokens, n_past);
+                    return whisper_build_graph_decoder(*ctx, *state, state->decoders[0], nullptr, n_tokens, n_past);
+                });
 
-        const size_t alloc_size = ggml_allocr_alloc_graph(state->alloc_decode, gf) + tensor_alignment;
-        ggml_allocr_free(state->alloc_decode);
-
-        log("%s: compute buffer (decode)      = %7.2f MB\n", __func__, (state->buf_compute.size() + alloc_size) / 1024.0 / 1024.0);
-
-        state->buf_decode.resize(alloc_size);
-        state->alloc_decode = ggml_allocr_new(state->buf_decode.data(), state->buf_decode.size(), tensor_alignment);
+        log("%s: compute buffer (decode) = %7.2f MB\n", __func__, whisper_allocr_size(state->alloc_decode) / 1024.0 / 1024.0);
     }
+
+#ifdef GGML_USE_METAL
+    state->ctx_metal = ggml_metal_init(1);
+    if (!state->ctx_metal) {
+        log("%s: ggml_metal_init() failed\n", __func__);
+        delete state;
+        return nullptr;
+    }
+
+    log("%s: Metal context initialized\n", __func__);
+
+    // this allocates all Metal resources and memory buffers
+
+    void * data_ptr  = NULL;
+    size_t data_size = 0;
+
+    // TODO: add mmap support
+    //if (params.use_mmap) {
+    //    data_ptr  = ctx->model.mapping->addr;
+    //    data_size = ctx->model.mapping->size;
+    //} else {
+    //    data_ptr  = ggml_get_mem_buffer(ctx->model.ctx);
+    //    data_size = ggml_get_mem_size  (ctx->model.ctx);
+    //}
+
+    data_ptr  = ggml_get_mem_buffer(ctx->model.ctx);
+    data_size = ggml_get_mem_size  (ctx->model.ctx);
+
+    const size_t max_size = ggml_get_max_tensor_size(ctx->model.ctx);
+
+    log("%s: max tensor size = %8.2f MB\n", __func__, max_size/1024.0/1024.0);
+
+#define WHISPER_METAL_CHECK_BUF(result)              \
+    if (!(result)) {                                 \
+        log("%s: failed to add metal buffer\n", __func__); \
+        delete state;                                \
+        return nullptr;                              \
+    }
+
+    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "data", data_ptr, data_size, max_size));
+
+    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "meta_conv",   state->alloc_conv.meta.data(),   state->alloc_conv.meta.size(),   0));
+    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "meta_encode", state->alloc_encode.meta.data(), state->alloc_encode.meta.size(), 0));
+    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "meta_cross",  state->alloc_cross.meta.data(),  state->alloc_cross.meta.size(),  0));
+    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "meta_decode", state->alloc_decode.meta.data(), state->alloc_decode.meta.size(), 0));
+
+    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "data_conv",   state->alloc_conv.data.data(),   state->alloc_conv.data.size(),   0));
+    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "data_encode", state->alloc_encode.data.data(), state->alloc_encode.data.size(), 0));
+    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "data_cross",  state->alloc_cross.data.data(),  state->alloc_cross.data.size(),  0));
+    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "data_decode", state->alloc_decode.data.data(), state->alloc_decode.data.size(), 0));
+
+    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "kv_cross",  state->kv_cross.buf.data(), state->kv_cross.buf.size(), 0));
+
+    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "kv_self_0", state->decoders[0].kv_self.buf.data(), state->decoders[0].kv_self.buf.size(), 0));
+#undef WHISPER_METAL_CHECK_BUF
+#endif
 
     state->rng = std::mt19937(0);
 
@@ -3046,17 +3148,10 @@ void whisper_free_state(struct whisper_state * state)
         }
 #endif
 
-        if (state->alloc_encode) {
-            ggml_allocr_free(state->alloc_encode);
-        }
-
-        if (state->alloc_encode_post) {
-            ggml_allocr_free(state->alloc_encode_post);
-        }
-
-        if (state->alloc_decode) {
-            ggml_allocr_free(state->alloc_decode);
-        }
+        whisper_allocr_free(state->alloc_conv);
+        whisper_allocr_free(state->alloc_decode);
+        whisper_allocr_free(state->alloc_cross);
+        whisper_allocr_free(state->alloc_encode);
 
         delete state;
     }
@@ -4342,6 +4437,21 @@ int whisper_full_with_state(
             decoder.probs.resize   (ctx->vocab.n_vocab);
             decoder.logits.resize  (ctx->vocab.n_vocab);
             decoder.logprobs.resize(ctx->vocab.n_vocab);
+
+            // TODO: not very clean - look for a better way and potentially merging with the init of decoder 0
+#ifdef GGML_USE_METAL
+#define WHISPER_METAL_CHECK_BUF(result)              \
+            if (!(result)) {                                 \
+                log("%s: failed to add metal buffer\n", __func__); \
+                return 0;                              \
+            }
+
+            const std::string kv_name = "kv_self_" + std::to_string(j);
+            auto & kv_self = decoder.kv_self;
+
+            WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, kv_name.c_str(), kv_self.buf.data(), kv_self.buf.size(), 0));
+#undef WHISPER_METAL_CHECK_BUF
+#endif
         }
     }
 
@@ -4534,8 +4644,8 @@ int whisper_full_with_state(
 
                         decoder.kv_self.n += prompt.size();
 
-                        memcpy(decoder.probs.data(), state->decoders[0].probs.data(),    decoder.probs.size()*sizeof(decoder.probs[0]));
-                        memcpy(decoder.logits.data(), state->decoders[0].logits.data(),   decoder.logits.size()*sizeof(decoder.logits[0]));
+                        memcpy(decoder.probs.data(),    state->decoders[0].probs.data(),    decoder.probs.size()*sizeof(decoder.probs[0]));
+                        memcpy(decoder.logits.data(),   state->decoders[0].logits.data(),   decoder.logits.size()*sizeof(decoder.logits[0]));
                         memcpy(decoder.logprobs.data(), state->decoders[0].logprobs.data(), decoder.logprobs.size()*sizeof(decoder.logprobs[0]));
                     }
 
@@ -5244,7 +5354,8 @@ WHISPER_API const char * whisper_bench_ggml_mul_mat_str(int n_threads) {
     // b: N*N*sizeof(float)
     // c: N*N*sizeof(float)
     // when F16 is used, there is an extra work buffer of size N*N*sizeof(float)
-    std::vector<char> buf(4llu*N_max*N_max*sizeof(float) + 4*512);
+    std::vector<uint8_t> buf(3llu*N_max*N_max*sizeof(float) + 3*ggml_tensor_overhead());
+    std::vector<uint8_t> work;
 
     // put a bunch of random data in the buffer
     for (size_t i = 0; i < buf.size(); i++) buf[i] = i;
@@ -5299,12 +5410,12 @@ WHISPER_API const char * whisper_bench_ggml_mul_mat_str(int n_threads) {
             double tsum = 0.0;
 
             // heat-up
-            ggml_graph_compute_with_ctx(ctx0, &gf, n_threads);
+            ggml_graph_compute_helper(work, &gf, n_threads);
 
             for (int i = 0; i < n_max; ++i) {
                 const int64_t t0 = ggml_time_us();
 
-                ggml_graph_compute_with_ctx(ctx0, &gf, n_threads);
+                ggml_graph_compute_helper(work, &gf, n_threads);
 
                 const int64_t t1 = ggml_time_us();
 
