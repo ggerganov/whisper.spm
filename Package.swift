@@ -58,7 +58,9 @@ let package = Package(
             sources: [
                 "Sources/whisper/ggml.c",
                 "Sources/whisper/ggml-alloc.c",
+                "Sources/whisper/ggml-backend.c",
                 "Sources/whisper/ggml-metal.m",
+                "Sources/whisper/ggml-quants.c",
                 "Sources/whisper/coreml/whisper-encoder-impl.m",
                 "Sources/whisper/coreml/whisper-encoder.mm",
                 "Sources/whisper/whisper.cpp",
