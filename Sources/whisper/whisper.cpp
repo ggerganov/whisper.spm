@@ -120,6 +120,7 @@ static void byteswap_tensor(ggml_tensor * tensor) {
 //#define WHISPER_USE_FLASH_ATTN
 //#define WHISPER_USE_FLASH_FF
 #define WHISPER_MAX_DECODERS 16
+#define WHISPER_MAX_NODES 4096
 
 //
 // ggml helpers
@@ -190,6 +191,15 @@ enum e_model {
     MODEL_SMALL,
     MODEL_MEDIUM,
     MODEL_LARGE,
+};
+
+static const std::map<e_model, std::string> g_model_name = {
+    { MODEL_UNKNOWN,  "unknown"  },
+    { MODEL_TINY,     "tiny"     },
+    { MODEL_BASE,     "base"     },
+    { MODEL_SMALL,    "small"    },
+    { MODEL_MEDIUM,   "medium"   },
+    { MODEL_LARGE,    "large"    },
 };
 
 static const std::map<std::string, std::pair<int, std::string>> g_lang = {
@@ -292,6 +302,7 @@ static const std::map<std::string, std::pair<int, std::string>> g_lang = {
     { "ba",  { 96,  "bashkir",        } },
     { "jw",  { 97,  "javanese",       } },
     { "su",  { 98,  "sundanese",      } },
+    { "yue", { 99,  "cantonese",      } },
 };
 
 static const size_t MB = 1ull*1024*1024;
@@ -401,7 +412,11 @@ struct whisper_vocab {
     id token_beg        = 50363; // begin timestamps
 
     bool is_multilingual() const {
-        return n_vocab == 51865;
+        return n_vocab >= 51865;
+    }
+
+    int num_languages() const {
+        return n_vocab - 51765 - (is_multilingual() ? 1 : 0);
     }
 };
 
@@ -663,7 +678,7 @@ static void whisper_allocr_graph_init(struct whisper_allocr & allocr, std::funct
     auto & meta  = allocr.meta;
     auto & data  = allocr.data;
 
-    meta.resize(ggml_tensor_overhead()*GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead());
+    meta.resize(ggml_tensor_overhead()*WHISPER_MAX_NODES + ggml_graph_overhead());
 
     alloc = ggml_allocr_new_measure(tensor_alignment);
 
@@ -735,7 +750,7 @@ struct whisper_state {
 
     int lang_id = 0; // english by default
 
-    std::string path_model; // populated by whisper_init_from_file()
+    std::string path_model; // populated by whisper_init_from_file_with_params()
 #ifdef WHISPER_USE_COREML
     whisper_coreml_context * ctx_coreml = nullptr;
 #endif
@@ -769,7 +784,8 @@ struct whisper_context {
     whisper_vocab vocab;
     whisper_state * state = nullptr;
 
-    std::string path_model; // populated by whisper_init_from_file()
+    std::string path_model; // populated by whisper_init_from_file_with_params()
+    whisper_context_params params;
 };
 
 static void whisper_default_log(const char * text) {
@@ -920,6 +936,8 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
 
         assert(hparams.n_text_state == hparams.n_audio_state);
 
+        std::string mver = "";
+
         if (hparams.n_audio_layer == 4) {
             model.type = e_model::MODEL_TINY;
         }
@@ -938,6 +956,10 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
 
         if (hparams.n_audio_layer == 32) {
             model.type = e_model::MODEL_LARGE;
+
+            if (hparams.n_vocab == 51866) {
+                mver = " v3";
+            }
         }
 
         const int32_t qntvr = hparams.ftype / GGML_QNT_VERSION_FACTOR;
@@ -966,7 +988,7 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         log("%s: n_mels        = %d\n", __func__, hparams.n_mels);
         log("%s: ftype         = %d\n", __func__, model.hparams.ftype);
         log("%s: qntvr         = %d\n", __func__, qntvr);
-        log("%s: type          = %d\n", __func__, model.type);
+        log("%s: type          = %d (%s%s)\n", __func__, model.type, g_model_name.at(model.type).c_str(), mver.c_str());
 
         // print memory requirements
         {
@@ -1037,13 +1059,17 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         if (vocab.is_multilingual()) {
             vocab.token_eot++;
             vocab.token_sot++;
-            vocab.token_translate++;
-            vocab.token_transcribe++;
-            vocab.token_solm++;
-            vocab.token_prev++;
-            vocab.token_nosp++;
-            vocab.token_not++;
-            vocab.token_beg++;
+
+            // account for variable number of language tokens
+            const int dt = vocab.num_languages() - 98;
+
+            vocab.token_translate  += dt;
+            vocab.token_transcribe += dt;
+            vocab.token_solm       += dt;
+            vocab.token_prev       += dt;
+            vocab.token_nosp       += dt;
+            vocab.token_not        += dt;
+            vocab.token_beg        += dt;
         }
 
         if (n_vocab < model.hparams.n_vocab) {
@@ -1072,6 +1098,8 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
                 vocab.id_to_token[i] = word;
             }
         }
+
+        log("%s: n_langs       = %d\n", __func__, vocab.num_languages());
     }
 
     size_t ctx_size = 0;
@@ -1616,7 +1644,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
 
     struct ggml_context * ctx0 = ggml_init(params);
 
-    ggml_cgraph * gf = ggml_new_graph(ctx0);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, WHISPER_MAX_NODES, false);
 
     ggml_allocr * alloc = wstate.alloc_encode.alloc;
 
@@ -2034,7 +2062,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
     struct ggml_context * ctx0 = ggml_init(params);
 
-    ggml_cgraph * gf = ggml_new_graph(ctx0);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, WHISPER_MAX_NODES, false);
 
     ggml_allocr * alloc = wstate.alloc_decode.alloc;
 
@@ -2929,59 +2957,64 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
     }
 
 #ifdef GGML_USE_METAL
-    state->ctx_metal = ggml_metal_init(1);
-    if (!state->ctx_metal) {
-        log("%s: ggml_metal_init() failed\n", __func__);
-        delete state;
-        return nullptr;
+    if (ctx->params.use_gpu) {
+        state->ctx_metal = ggml_metal_init(1);
+        if (!state->ctx_metal) {
+            log("%s: ggml_metal_init() failed\n", __func__);
+            delete state;
+            return nullptr;
+        }
     }
 
-    log("%s: Metal context initialized\n", __func__);
+    if (state->ctx_metal) {
+        log("%s: Metal context initialized\n", __func__);
 
-    // this allocates all Metal resources and memory buffers
+        // this allocates all Metal resources and memory buffers
 
-    void * data_ptr  = NULL;
-    size_t data_size = 0;
+        void * data_ptr  = NULL;
+        size_t data_size = 0;
 
-    // TODO: add mmap support
-    //if (params.use_mmap) {
-    //    data_ptr  = ctx->model.mapping->addr;
-    //    data_size = ctx->model.mapping->size;
-    //} else {
-    //    data_ptr  = ggml_get_mem_buffer(ctx->model.ctx);
-    //    data_size = ggml_get_mem_size  (ctx->model.ctx);
-    //}
+        // TODO: add mmap support
+        //if (params.use_mmap) {
+        //    data_ptr  = ctx->model.mapping->addr;
+        //    data_size = ctx->model.mapping->size;
+        //} else {
+        //    data_ptr  = ggml_get_mem_buffer(ctx->model.ctx);
+        //    data_size = ggml_get_mem_size  (ctx->model.ctx);
+        //}
 
-    data_ptr  = ggml_get_mem_buffer(ctx->model.ctx);
-    data_size = ggml_get_mem_size  (ctx->model.ctx);
+        data_ptr  = ggml_get_mem_buffer(ctx->model.ctx);
+        data_size = ggml_get_mem_size  (ctx->model.ctx);
 
-    const size_t max_size = ggml_get_max_tensor_size(ctx->model.ctx);
+        const size_t max_size = ggml_get_max_tensor_size(ctx->model.ctx);
 
-    log("%s: max tensor size = %8.2f MB\n", __func__, max_size/1024.0/1024.0);
+        log("%s: max tensor size = %8.2f MB\n", __func__, max_size/1024.0/1024.0);
 
 #define WHISPER_METAL_CHECK_BUF(result)              \
-    if (!(result)) {                                 \
-        log("%s: failed to add metal buffer\n", __func__); \
-        delete state;                                \
-        return nullptr;                              \
-    }
+        if (!(result)) {                                 \
+            log("%s: failed to add metal buffer\n", __func__); \
+            delete state;                                \
+            return nullptr;                              \
+        }
 
-    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "data", data_ptr, data_size, max_size));
+        WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "data", data_ptr, data_size, max_size));
 
-    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "meta_conv",   state->alloc_conv.meta.data(),   state->alloc_conv.meta.size(),   0));
-    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "meta_encode", state->alloc_encode.meta.data(), state->alloc_encode.meta.size(), 0));
-    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "meta_cross",  state->alloc_cross.meta.data(),  state->alloc_cross.meta.size(),  0));
-    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "meta_decode", state->alloc_decode.meta.data(), state->alloc_decode.meta.size(), 0));
+        WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "meta_conv",   state->alloc_conv.meta.data(),   state->alloc_conv.meta.size(),   0));
+        WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "meta_encode", state->alloc_encode.meta.data(), state->alloc_encode.meta.size(), 0));
+        WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "meta_cross",  state->alloc_cross.meta.data(),  state->alloc_cross.meta.size(),  0));
+        WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "meta_decode", state->alloc_decode.meta.data(), state->alloc_decode.meta.size(), 0));
 
-    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "data_conv",   state->alloc_conv.data.data(),   state->alloc_conv.data.size(),   0));
-    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "data_encode", state->alloc_encode.data.data(), state->alloc_encode.data.size(), 0));
-    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "data_cross",  state->alloc_cross.data.data(),  state->alloc_cross.data.size(),  0));
-    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "data_decode", state->alloc_decode.data.data(), state->alloc_decode.data.size(), 0));
+        WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "data_conv",   state->alloc_conv.data.data(),   state->alloc_conv.data.size(),   0));
+        WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "data_encode", state->alloc_encode.data.data(), state->alloc_encode.data.size(), 0));
+        WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "data_cross",  state->alloc_cross.data.data(),  state->alloc_cross.data.size(),  0));
+        WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "data_decode", state->alloc_decode.data.data(), state->alloc_decode.data.size(), 0));
 
-    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "kv_cross",  state->kv_cross.buf.data(), state->kv_cross.buf.size(), 0));
+        WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "kv_cross",  state->kv_cross.buf.data(), state->kv_cross.buf.size(), 0));
 
-    WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "kv_self_0", state->decoders[0].kv_self.buf.data(), state->decoders[0].kv_self.buf.size(), 0));
+        WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, "kv_self_0", state->decoders[0].kv_self.buf.data(), state->decoders[0].kv_self.buf.size(), 0));
 #undef WHISPER_METAL_CHECK_BUF
+
+    }
 #endif
 
     state->rng = std::mt19937(0);
@@ -3038,7 +3071,14 @@ int whisper_ctx_init_openvino_encoder(
 #endif
 }
 
-struct whisper_context * whisper_init_from_file_no_state(const char * path_model) {
+struct whisper_context_params whisper_context_default_params() {
+    struct whisper_context_params result = {
+        /*.use_gpu    =*/ true,
+    };
+    return result;
+}
+
+struct whisper_context * whisper_init_from_file_with_params_no_state(const char * path_model, struct whisper_context_params params) {
     log("%s: loading model from '%s'\n", __func__, path_model);
 
     auto fin = std::ifstream(path_model, std::ios::binary);
@@ -3067,7 +3107,7 @@ struct whisper_context * whisper_init_from_file_no_state(const char * path_model
         fin->close();
     };
 
-    auto ctx = whisper_init_no_state(&loader);
+    auto ctx = whisper_init_with_params_no_state(&loader, params);
 
     if (ctx) {
         ctx->path_model = path_model;
@@ -3076,7 +3116,7 @@ struct whisper_context * whisper_init_from_file_no_state(const char * path_model
     return ctx;
 }
 
-struct whisper_context * whisper_init_from_buffer_no_state(void * buffer, size_t buffer_size) {
+struct whisper_context * whisper_init_from_buffer_with_params_no_state(void * buffer, size_t buffer_size, struct whisper_context_params params) {
     struct buf_context {
         uint8_t* buffer;
         size_t size;
@@ -3110,13 +3150,14 @@ struct whisper_context * whisper_init_from_buffer_no_state(void * buffer, size_t
 
     loader.close = [](void * /*ctx*/) { };
 
-    return whisper_init_no_state(&loader);
+    return whisper_init_with_params_no_state(&loader, params);
 }
 
-struct whisper_context * whisper_init_no_state(struct whisper_model_loader * loader) {
+struct whisper_context * whisper_init_with_params_no_state(struct whisper_model_loader * loader, struct whisper_context_params params) {
     ggml_time_init();
 
     whisper_context * ctx = new whisper_context;
+    ctx->params = params;
 
     if (!whisper_model_load(loader, *ctx)) {
         loader->close(loader->context);
@@ -3130,8 +3171,8 @@ struct whisper_context * whisper_init_no_state(struct whisper_model_loader * loa
     return ctx;
 }
 
-struct whisper_context * whisper_init_from_file(const char * path_model) {
-    whisper_context * ctx = whisper_init_from_file_no_state(path_model);
+struct whisper_context * whisper_init_from_file_with_params(const char * path_model, struct whisper_context_params params) {
+    whisper_context * ctx = whisper_init_from_file_with_params_no_state(path_model, params);
     if (!ctx) {
         return nullptr;
     }
@@ -3143,36 +3184,60 @@ struct whisper_context * whisper_init_from_file(const char * path_model) {
     }
 
     return ctx;
+}
+
+struct whisper_context * whisper_init_from_buffer_with_params(void * buffer, size_t buffer_size, struct whisper_context_params params) {
+    whisper_context * ctx = whisper_init_from_buffer_with_params_no_state(buffer, buffer_size, params);
+    if (!ctx) {
+        return nullptr;
+    }
+
+    ctx->state = whisper_init_state(ctx);
+    if (!ctx->state) {
+        whisper_free(ctx);
+        return nullptr;
+    }
+
+    return ctx;
+}
+
+struct whisper_context * whisper_init_with_params(struct whisper_model_loader * loader, struct whisper_context_params params) {
+    whisper_context * ctx = whisper_init_with_params_no_state(loader, params);
+    if (!ctx) {
+        return nullptr;
+    }
+
+    ctx->state = whisper_init_state(ctx);
+    if (!ctx->state) {
+        whisper_free(ctx);
+        return nullptr;
+    }
+
+    return ctx;
+}
+
+struct whisper_context * whisper_init_from_file(const char * path_model) {
+    return whisper_init_from_file_with_params(path_model, whisper_context_default_params());
 }
 
 struct whisper_context * whisper_init_from_buffer(void * buffer, size_t buffer_size) {
-    whisper_context * ctx = whisper_init_from_buffer_no_state(buffer, buffer_size);
-    if (!ctx) {
-        return nullptr;
-    }
-
-    ctx->state = whisper_init_state(ctx);
-    if (!ctx->state) {
-        whisper_free(ctx);
-        return nullptr;
-    }
-
-    return ctx;
+    return whisper_init_from_buffer_with_params(buffer, buffer_size, whisper_context_default_params());
 }
 
 struct whisper_context * whisper_init(struct whisper_model_loader * loader) {
-    whisper_context * ctx = whisper_init_no_state(loader);
-    if (!ctx) {
-        return nullptr;
-    }
+    return whisper_init_with_params(loader, whisper_context_default_params());
+}
 
-    ctx->state = whisper_init_state(ctx);
-    if (!ctx->state) {
-        whisper_free(ctx);
-        return nullptr;
-    }
+struct whisper_context * whisper_init_from_file_no_state(const char * path_model) {
+    return whisper_init_from_file_with_params_no_state(path_model, whisper_context_default_params());
+}
 
-    return ctx;
+struct whisper_context * whisper_init_from_buffer_no_state(void * buffer, size_t buffer_size) {
+    return whisper_init_from_buffer_with_params_no_state(buffer, buffer_size, whisper_context_default_params());
+}
+
+struct whisper_context * whisper_init_no_state(struct whisper_model_loader * loader) {
+    return whisper_init_with_params_no_state(loader, whisper_context_default_params());
 }
 
 void whisper_free_state(struct whisper_state * state)
@@ -3229,6 +3294,12 @@ void whisper_free(struct whisper_context * ctx) {
     }
 }
 
+void whisper_free_context_params(struct whisper_context_params * params) {
+    if (params) {
+        delete params;
+    }
+}
+
 void whisper_free_params(struct whisper_full_params * params) {
     if (params) {
         delete params;
@@ -3236,7 +3307,7 @@ void whisper_free_params(struct whisper_full_params * params) {
 }
 
 int whisper_pcm_to_mel_with_state(struct whisper_context * ctx, struct whisper_state * state, const float * samples, int n_samples, int n_threads) {
-    if (!log_mel_spectrogram(*state, samples, n_samples, WHISPER_SAMPLE_RATE, WHISPER_N_FFT, WHISPER_HOP_LENGTH, WHISPER_N_MEL, n_threads, ctx->model.filters, false, state->mel)) {
+    if (!log_mel_spectrogram(*state, samples, n_samples, WHISPER_SAMPLE_RATE, WHISPER_N_FFT, WHISPER_HOP_LENGTH, ctx->model.filters.n_mel, n_threads, ctx->model.filters, false, state->mel)) {
         log("%s: failed to compute mel spectrogram\n", __func__);
         return -1;
     }
@@ -3250,7 +3321,7 @@ int whisper_pcm_to_mel(struct whisper_context * ctx, const float * samples, int 
 
 // same as whisper_pcm_to_mel, but applies a Phase Vocoder to speed up the audio x2 (PV without phase lock is not good)
 int whisper_pcm_to_mel_phase_vocoder_with_state(struct whisper_context * ctx, struct whisper_state * state, const float * samples, int n_samples, int n_threads) {
-    if (!log_mel_spectrogram(*state, samples, n_samples, WHISPER_SAMPLE_RATE, 2 * WHISPER_N_FFT, 2 * WHISPER_HOP_LENGTH, WHISPER_N_MEL, n_threads, ctx->model.filters, false, state->mel)) {
+    if (!log_mel_spectrogram(*state, samples, n_samples, WHISPER_SAMPLE_RATE, 2 * WHISPER_N_FFT, 2 * WHISPER_HOP_LENGTH, ctx->model.filters.n_mel, n_threads, ctx->model.filters, false, state->mel)) {
         log("%s: failed to compute mel spectrogram\n", __func__);
         return -1;
     }
@@ -3273,13 +3344,13 @@ int whisper_pcm_to_mel_phase_vocoder(struct whisper_context * ctx, const float *
 // TODO
 
 int whisper_set_mel_with_state(
-        struct whisper_context * /*ctx*/,
+        struct whisper_context * ctx,
           struct whisper_state * state,
                    const float * data,
                            int   n_len,
                            int   n_mel) {
-    if (n_mel != WHISPER_N_MEL) {
-        log("%s: invalid number of mel bands: %d (expected %d)\n", __func__, n_mel, WHISPER_N_MEL);
+    if (n_mel != ctx->model.filters.n_mel) {
+        log("%s: invalid number of mel bands: %d (expected %d)\n", __func__, n_mel, ctx->model.filters.n_mel);
         return -1;
     }
 
@@ -3643,6 +3714,7 @@ void whisper_print_timings(struct whisper_context * ctx) {
 }
 
 void whisper_reset_timings(struct whisper_context * ctx) {
+    ctx->t_start_us = ggml_time_us();
     if (ctx->state != nullptr) {
         ctx->state->t_sample_us = 0;
         ctx->state->t_encode_us = 0;
@@ -3696,6 +3768,14 @@ const char * whisper_print_system_info(void) {
 }
 
 ////////////////////////////////////////////////////////////////////////////
+
+struct whisper_context_params * whisper_context_default_params_by_ref() {
+    struct whisper_context_params params = whisper_context_default_params();
+
+    struct whisper_context_params* result = new whisper_context_params();
+    *result = params;
+    return result;
+}
 
 struct whisper_full_params * whisper_full_default_params_by_ref(enum whisper_sampling_strategy strategy) {
     struct whisper_full_params params = whisper_full_default_params(strategy);
@@ -3772,6 +3852,9 @@ struct whisper_full_params whisper_full_default_params(enum whisper_sampling_str
 
         /*.encoder_begin_callback           =*/ nullptr,
         /*.encoder_begin_callback_user_data =*/ nullptr,
+
+        /*.abort_callback                   =*/ nullptr,
+        /*.abort_callback_user_data         =*/ nullptr,
 
         /*.logits_filter_callback           =*/ nullptr,
         /*.logits_filter_callback_user_data =*/ nullptr,
@@ -3939,6 +4022,7 @@ static void whisper_process_logits(
         // suppress task tokens
         logits[vocab.token_translate]  = -INFINITY;
         logits[vocab.token_transcribe] = -INFINITY;
+        logits[vocab.token_prev]       = -INFINITY;
 
         if (params.logits_filter_callback) {
             params.logits_filter_callback(&ctx, &state, tokens_cur.data(), tokens_cur.size(), logits.data(), params.logits_filter_callback_user_data);
@@ -4505,17 +4589,19 @@ int whisper_full_with_state(
 
             // TODO: not very clean - look for a better way and potentially merging with the init of decoder 0
 #ifdef GGML_USE_METAL
+            if (state->ctx_metal) {
 #define WHISPER_METAL_CHECK_BUF(result)              \
-            if (!(result)) {                                 \
-                log("%s: failed to add metal buffer\n", __func__); \
-                return 0;                              \
-            }
+                if (!(result)) {                                 \
+                    log("%s: failed to add metal buffer\n", __func__); \
+                    return 0;                              \
+                }
 
-            const std::string kv_name = "kv_self_" + std::to_string(j);
-            auto & kv_self = decoder.kv_self;
+                const std::string kv_name = "kv_self_" + std::to_string(j);
+                auto & kv_self = decoder.kv_self;
 
-            WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, kv_name.c_str(), kv_self.buf.data(), kv_self.buf.size(), 0));
+                WHISPER_METAL_CHECK_BUF(ggml_metal_add_buffer(state->ctx_metal, kv_name.c_str(), kv_self.buf.data(), kv_self.buf.size(), 0));
 #undef WHISPER_METAL_CHECK_BUF
+            }
 #endif
         }
     }
@@ -4557,6 +4643,7 @@ int whisper_full_with_state(
 
     // these tokens determine the task that will be performed
     std::vector<whisper_token> prompt_init = { whisper_token_sot(ctx) };
+
     if (whisper_is_multilingual(ctx)) {
         const int lang_id = whisper_lang_id(params.language);
         state->lang_id = lang_id;
@@ -4565,6 +4652,17 @@ int whisper_full_with_state(
             prompt_init.push_back(whisper_token_translate(ctx));
         } else {
             prompt_init.push_back(whisper_token_transcribe(ctx));
+        }
+    }
+
+    {
+        const bool is_distil = ctx->model.hparams.n_text_layer == 2;
+
+        // distilled models require the "no_timestamps" token
+        // TODO: add input parameter (#1229)
+        if (is_distil) {
+            log("%s: using distilled model - forcing no_timestamps\n", __func__);
+            prompt_init.push_back(whisper_token_not(ctx));
         }
     }
 

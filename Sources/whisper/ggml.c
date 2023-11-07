@@ -42,12 +42,6 @@
 
 #include <windows.h>
 
-#undef MIN
-#undef MAX
-
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
-
 typedef volatile LONG atomic_int;
 typedef atomic_int atomic_bool;
 
@@ -276,6 +270,12 @@ inline static void * ggml_aligned_malloc(size_t size) {
 
 // floating point type used to accumulate sums
 typedef double ggml_float;
+
+#undef MIN
+#undef MAX
+
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 //
 // global data
@@ -609,6 +609,18 @@ ggml_type_traits_t ggml_internal_get_type_traits(enum ggml_type type) {
 //
 // simd mappings
 //
+
+#if defined(__ARM_NEON)
+#if !defined(__aarch64__)
+
+// 64-bit compatibility
+
+inline static float vaddvq_f32(float32x4_t v) {
+    return vgetq_lane_f32(v, 0) + vgetq_lane_f32(v, 1) + vgetq_lane_f32(v, 2) + vgetq_lane_f32(v, 3);
+}
+
+#endif
+#endif
 
 // we define a common set of C macros which map to specific intrinsics based on the current architecture
 // we then implement the fundamental computation operations below using only these macros
