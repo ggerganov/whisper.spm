@@ -4,7 +4,7 @@ default: build-submodule
 update-submodule:
 	# create a clean (maybe updated) copy of whisper.cpp
 	rsync ../../ggml.c              Sources/whisper/
-	rsync ../../ggml.h              Sources/whisper/
+	rsync ../../ggml.h              Sources/whisper/include/
 	rsync ../../ggml-alloc.c        Sources/whisper/
 	rsync ../../ggml-alloc.h        Sources/whisper/
 	rsync ../../ggml-backend.c      Sources/whisper/
@@ -16,8 +16,8 @@ update-submodule:
 	rsync ../../ggml-metal.metal    Sources/whisper/
 	rsync ../../ggml-quants.c       Sources/whisper/
 	rsync ../../ggml-quants.h       Sources/whisper/
-	rsync ../../whisper.cpp         Sources/whisper/
-	rsync ../../whisper.h           Sources/whisper/include/
+	rsync ../../whisper.cpp         Sources/whispercpp/
+	rsync ../../whisper.h           Sources/whispercpp/include/
 
 SOURCES := $(shell find Sources/ -print)
 .build: $(SOURCES)

@@ -1,7 +1,7 @@
 // Basic usage of whisper.cpp in Swift
 
 import Foundation
-import whisper
+import whispercpp
 
 let cparams = whisper_context_default_params()
 
