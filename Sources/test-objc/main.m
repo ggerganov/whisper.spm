@@ -15,7 +15,9 @@
 
 int main(void) {
     // load the model (use correct path)
-    struct whisper_context * ctx = whisper_init_from_file("models/for-tests-ggml-base.en.bin");
+    struct whisper_context_params cparams = whisper_context_default_params();
+
+    struct whisper_context * ctx = whisper_init_from_file_with_params("models/for-tests-ggml-base.en.bin", cparams);
     CHECK_T(ctx != NULL);
 
     // run the model

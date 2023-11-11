@@ -3,7 +3,9 @@
 import Foundation
 import whisper
 
-let ctx = whisper_init_from_file("models/for-tests-ggml-base.en.bin")
+let cparams = whisper_context_default_params()
+
+let ctx = whisper_init_from_file_with_params("models/for-tests-ggml-base.en.bin", cparams)
 
 var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
 
