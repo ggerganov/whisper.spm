@@ -196,7 +196,7 @@ struct ggml_metal_context * ggml_metal_init(int n_cb) {
     // load library
     {
         NSBundle * bundle = nil;
-#ifdef SWIFT_PACKAGE
+#ifdef SWIFTPM_MODULE_BUNDLE
         bundle = SWIFTPM_MODULE_BUNDLE;
 #else
         bundle = [NSBundle bundleForClass:[GGMLMetalClass class]];

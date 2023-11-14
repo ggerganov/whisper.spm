@@ -20,26 +20,41 @@ let platforms: [SupportedPlatform]? = [
     .tvOS(.v14)
 ]
 
-// TODO: make Metal work - I can't figure out how to build ggml-metal.m
-//       it keeps giving an error that NSString is unknown type name
-//       in llama.cpp it somehow works ..
-//       if someone can figure this out, please let me know or open a PR
-let exclude: [String] = ["Sources/whisper/ggml-metal.m", "Sources/whisper/ggml-metal.metal"]
+let exclude: [String] = []
 let additionalSources: [String] = []
-let additionalSettings: [CSetting] = []
+let additionalSettings: [CSetting] = [
+    .define("GGML_SWIFT"),
+    .define("GGML_USE_METAL")
+]
+let additionalDependencies: [Target.Dependency] = ["whisper-metal"]
 
-//let exclude: [String] = []
-//let additionalSources: [String] = ["Sources/whisper/ggml-metal.m"]
-//let additionalSettings: [CSetting] = [
-//    .unsafeFlags(["-fno-objc-arc"]),
-//    .define("GGML_SWIFT"),
-//    .define("GGML_USE_METAL")
-//]
+let additionalTargets: [Target] = [
+  Target.target(
+      name: "whisper-metal",
+      path: ".",
+      sources: [
+          "Sources/whisper/ggml-metal.m",
+          "Sources/whisper/ggml-metal.metal"
+      ],
+      cSettings: [
+          .unsafeFlags(["-Wno-shorten-64-to-32"]),
+          .define("GGML_USE_ACCELERATE"),
+          .define("WHISPER_USE_COREML"),
+          .define("WHISPER_COREML_ALLOW_FALLBACK"),
+          .unsafeFlags(["-fno-objc-arc"])
+      ] + additionalSettings,
+      linkerSettings: [
+          .linkedFramework("Accelerate")
+      ])
+]
+
 #else
 let platforms: [SupportedPlatform]? = nil
-let exclude: [String] = ["Sources/whisper/ggml-metal.m", "Sources/whisper/ggml-metal.metal"]
+let exclude: [String] = []
 let additionalSources: [String] = []
 let additionalSettings: [CSetting] = []
+let additionalDependencies: [Target.Dependency] = []
+let additionalTargets: [Target] = []
 #endif
 
 let package = Package(
@@ -53,13 +68,13 @@ let package = Package(
     targets: [
         .target(
             name: "whisper",
+            dependencies: [] + additionalDependencies,
             path: ".",
             exclude: exclude,
             sources: [
                 "Sources/whisper/ggml.c",
                 "Sources/whisper/ggml-alloc.c",
                 "Sources/whisper/ggml-backend.c",
-                "Sources/whisper/ggml-metal.m",
                 "Sources/whisper/ggml-quants.c",
                 "Sources/whisper/coreml/whisper-encoder-impl.m",
                 "Sources/whisper/coreml/whisper-encoder.mm",
@@ -69,6 +84,7 @@ let package = Package(
             cSettings: [
                 .unsafeFlags(["-Wno-shorten-64-to-32"]),
                 .define("GGML_USE_ACCELERATE"),
+                .define("GGML_USE_METAL"),
                 .define("WHISPER_USE_COREML"),
                 .define("WHISPER_COREML_ALLOW_FALLBACK")
             ] + additionalSettings,
@@ -78,6 +94,6 @@ let package = Package(
         ),
         .target(name: "test-objc",  dependencies:["whisper"]),
         .target(name: "test-swift", dependencies:["whisper"])
-    ],
+    ] + additionalTargets,
     cxxLanguageStandard: CXXLanguageStandard.cxx11
 )
