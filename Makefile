@@ -4,7 +4,6 @@ default: build-submodule
 update-submodule:
 	# create a clean (maybe updated) copy of whisper.cpp
 	rsync ../../ggml.c              Sources/whisper/
-	rsync ../../ggml.h              Sources/whisper/
 	rsync ../../ggml-alloc.c        Sources/whisper/
 	rsync ../../ggml-alloc.h        Sources/whisper/
 	rsync ../../ggml-backend.c      Sources/whisper/
@@ -17,7 +16,9 @@ update-submodule:
 	rsync ../../ggml-quants.c       Sources/whisper/
 	rsync ../../ggml-quants.h       Sources/whisper/
 	rsync ../../whisper.cpp         Sources/whisper/
+	rsync ../../ggml.h              Sources/whisper/include/
 	rsync ../../whisper.h           Sources/whisper/include/
+	rsync ../../coreml/*            Sources/whisper/coreml/
 
 SOURCES := $(shell find Sources/ -print)
 .build: $(SOURCES)
@@ -41,7 +42,7 @@ publish: publish-trigger
 		\n\
 		cd /path/to/whisper.cpp/bindings/ios\n\
 		git commit\n\
-		git tag 1.4.3\n\
+		git tag 1.5.0\n\
 		git push origin master --tags\n\
 		"
 
