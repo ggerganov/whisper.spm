@@ -1,3 +1,9 @@
+# THIS REPO WILL SOON BE ARCHIVED SOON AND NO LONGER MAINTAINED
+
+# Please use the Swift package directly from [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
+
+---
+
 # whisper.spm
 
 [whisper.cpp](https://github.com/ggerganov/whisper.cpp) package for the Swift Package Manager
