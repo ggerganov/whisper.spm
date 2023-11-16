@@ -1,4 +1,4 @@
-# THIS REPO WILL SOON BE ARCHIVED SOON AND NO LONGER MAINTAINED
+# THIS REPO WILL SOON BE ARCHIVED AND NO LONGER MAINTAINED
 
 # Please use the Swift package directly from [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
 
