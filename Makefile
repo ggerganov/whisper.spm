@@ -42,7 +42,7 @@ publish: publish-trigger
 		\n\
 		cd /path/to/whisper.cpp/bindings/ios\n\
 		git commit\n\
-		git tag 1.5.3\n\
+		git tag 1.5.4\n\
 		git push origin master --tags\n\
 		"
 
