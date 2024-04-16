@@ -9,6 +9,7 @@ update-submodule:
 	rsync ../../ggml-backend.c      Sources/whisper/
 	rsync ../../ggml-backend.h      Sources/whisper/
 	rsync ../../ggml-backend-impl.h Sources/whisper/
+	rsync ../../ggml-common.h       Sources/whisper/
 	rsync ../../ggml-impl.h         Sources/whisper/
 	rsync ../../ggml-metal.h        Sources/whisper/
 	rsync ../../ggml-metal.m        Sources/whisper/

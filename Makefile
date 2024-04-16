@@ -9,6 +9,7 @@ update-submodule:
 	rsync ../../ggml-backend.c      Sources/whisper/
 	rsync ../../ggml-backend.h      Sources/whisper/
 	rsync ../../ggml-backend-impl.h Sources/whisper/
+	rsync ../../ggml-common.h       Sources/whisper/
 	rsync ../../ggml-impl.h         Sources/whisper/
 	rsync ../../ggml-metal.h        Sources/whisper/
 	rsync ../../ggml-metal.m        Sources/whisper/
@@ -42,7 +43,7 @@ publish: publish-trigger
 		\n\
 		cd /path/to/whisper.cpp/bindings/ios\n\
 		git commit\n\
-		git tag 1.5.4\n\
+		git tag 1.5.5\n\
 		git push origin master --tags\n\
 		"
 
